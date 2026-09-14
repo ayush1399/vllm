@@ -145,6 +145,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=1,
+            dynamic_sd_query_lens=False,
         )
 
     def capture(self) -> None:

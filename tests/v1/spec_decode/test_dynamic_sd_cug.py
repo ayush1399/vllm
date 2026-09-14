@@ -432,3 +432,42 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                 assert desc.num_tokens == num_tokens
                 assert desc.num_reqs is None
             assert desc.num_active_loras == 0
+
+
+def test_dynamic_sd_fixed_query_len_manager_must_opt_out(monkeypatch):
+    """A fixed-query-length manager must opt out of per-K expansion.
+
+    Without the opt-out, decode_query_len <= num_speculative_tokens is
+    rejected at init.
+    """
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+
+    vllm_config = _create_vllm_config_for_dsd(max_num_seqs=16, max_spec_tokens=8)
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=1,
+        dynamic_sd_query_lens=False,
+    )
+    full_query_lens = {
+        desc.uniform_token_count for desc in manager._capture_descs[CUDAGraphMode.FULL]
+    }
+    assert full_query_lens == {1}
+
+    with pytest.raises(AssertionError, match="must exceed"):
+        gpu_cudagraph_utils.CudaGraphManager(
+            vllm_config=vllm_config,
+            device=torch.device("cpu"),
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            decode_query_len=8,
+        )

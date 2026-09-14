@@ -144,6 +144,7 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        dynamic_sd_query_lens: bool = True,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -153,6 +154,10 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        # False when every decode batch has exactly decode_query_len tokens
+        # per request; per-K graphs would then never be dispatched, and a
+        # decode_query_len <= num_speculative_tokens is rejected at init.
+        self.dynamic_sd_query_lens = dynamic_sd_query_lens
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -236,12 +241,17 @@ class CudaGraphManager:
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
+            and self.dynamic_sd_query_lens
         ):
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
             # _per_step. Recover num_new_sampled_tokens_per_step
             # from the values the manager already has.
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
+            assert num_new_sampled_tokens_per_step >= 1, (
+                f"decode_query_len={self.decode_query_len} must exceed "
+                f"num_speculative_tokens={self.vllm_config.num_speculative_tokens}"
             )
             dense_schedule = build_dynamic_sd_schedule_lookup(
                 speculative_config.num_speculative_tokens_per_batch_size,

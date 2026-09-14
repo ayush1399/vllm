@@ -143,6 +143,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            # Every draft step is exactly num_query_per_req tokens, so
+            # per-K graphs would never be dispatched.
+            dynamic_sd_query_lens=False,
         )
 
     def capture(self) -> None:
