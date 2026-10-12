@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the JIT monitor hooks. Backends are mocked, so no GPU."""
 
+import functools
 import inspect
 import os
 import sys
@@ -457,3 +458,91 @@ def test_tilelang_error_mode_raises():
         jit_monitor.activate(mode="error")
         with pytest.raises(RuntimeError, match="TileLang JIT compilation"):
             JITKernel(func=func)
+
+
+# ------------------------------------------------------------------
+# DeepGEMM hook
+# ------------------------------------------------------------------
+
+
+def _tensor(*shape: int):
+    return SimpleNamespace(shape=shape)
+
+
+@pytest.fixture
+def fake_deep_gemm(tmp_path, monkeypatch):
+    """Imported DeepGEMM stand-in whose ``fp8_gemm_nt`` compiles on request."""
+    from vllm.utils import deep_gemm as deep_gemm_utils
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / f"warm_kernel.{'0' * 32}").mkdir()
+    module = cast(Any, ModuleType("deep_gemm"))
+    module.compile_next = None
+
+    def fp8_gemm_nt(a, b, d):
+        if module.compile_next:
+            (cache / f"{module.compile_next}.{'f' * 32}").mkdir()
+            module.compile_next = None
+        return "ok"
+
+    module.fp8_gemm_nt = fp8_gemm_nt
+    import_deep_gemm = functools.cache(lambda: module)
+    import_deep_gemm()
+    monkeypatch.setattr(deep_gemm_utils, "_import_deep_gemm", import_deep_gemm)
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_gemm_nt_impl", fp8_gemm_nt)
+    monkeypatch.setenv("DG_JIT_CACHE_DIR", str(tmp_path))
+    # Real compiles take seconds; check every call instead of sleeping.
+    monkeypatch.setattr(jit_monitor, "_DEEP_GEMM_SLOW_CALL_S", -1.0)
+    return module
+
+
+def test_deep_gemm_compile_logs_warning(fake_deep_gemm):
+    from vllm.utils import deep_gemm as deep_gemm_utils
+
+    with _patch_jit_modules(_make_fake_knobs()):
+        jit_monitor.activate()
+    fake_deep_gemm.compile_next = "sm90_fp8_gemm_1d2d"
+    with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
+        result = deep_gemm_utils._fp8_gemm_nt_impl(
+            (_tensor(16, 5376), _tensor(16, 42)),
+            (_tensor(2048, 5376), _tensor(16, 42)),
+            _tensor(16, 2048),
+        )
+
+    assert result == "ok"
+    warning_once.assert_called_once()
+    msg = warning_once.call_args[0][0] % warning_once.call_args[0][1:]
+    assert "DeepGEMM kernel JIT compilation during inference: sm90_fp8_gemm_1d2d" in msg
+    assert "fp8_gemm_nt" in msg and "(2048, 5376)" in msg
+
+
+def test_deep_gemm_error_mode_raises(fake_deep_gemm):
+    with _patch_jit_modules(_make_fake_knobs()):
+        jit_monitor.activate(mode="error")
+    fake_deep_gemm.compile_next = "sm90_fp8_gemm_1d2d"
+    with pytest.raises(RuntimeError, match="DeepGEMM kernel JIT compilation"):
+        fake_deep_gemm.fp8_gemm_nt(_tensor(4, 128), _tensor(128, 128), _tensor(4, 128))
+
+
+def test_deep_gemm_cache_hit_does_not_log(fake_deep_gemm):
+    """Kernels compiled before activation (warmup) or loaded from the cache
+    must not be reported."""
+    with _patch_jit_modules(_make_fake_knobs()):
+        jit_monitor.activate()
+    with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
+        fake_deep_gemm.fp8_gemm_nt(_tensor(4, 128), _tensor(128, 128), _tensor(4, 128))
+
+    warning_once.assert_not_called()
+
+
+def test_deep_gemm_hook_skipped_when_not_imported(monkeypatch):
+    """The monitor must not import DeepGEMM into processes that never used it."""
+    from vllm.utils import deep_gemm as deep_gemm_utils
+
+    import_deep_gemm = functools.cache(lambda: pytest.fail("imported DeepGEMM"))
+    monkeypatch.setattr(deep_gemm_utils, "_import_deep_gemm", import_deep_gemm)
+    with _patch_jit_modules(_make_fake_knobs()):
+        jit_monitor.activate()
+
+    assert not jit_monitor._deep_gemm_hook_installed

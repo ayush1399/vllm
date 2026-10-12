@@ -18,15 +18,19 @@ Currently monitors:
 - Triton ``@triton.jit`` first-time compilations
   (via ``knobs.runtime.jit_post_compile_hook``)
 - TileLang ``@tilelang.jit`` first-time compilations
+- DeepGEMM kernel compilations (kernels added to its JIT cache during a call)
 """
 
 import contextlib
 import functools
 import importlib
 import os
-from collections.abc import Iterator, Mapping
+import time
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from typing import Any, Literal, cast
+
+import regex as re
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -41,6 +45,9 @@ _verbose: bool = False
 _cutedsl_hook_installed: bool = False
 _tilelang_hook_installed: bool = False
 _tilelang_jitimpl_compile_depth: int = 0
+_deep_gemm_hook_installed: bool = False
+_deep_gemm_cache_dir: str | None = None
+_deep_gemm_cached: set[str] = set()
 
 
 def is_active() -> bool:
@@ -80,6 +87,8 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     # TODO: Remove the guard once tilelang upstream is fixed.
     if not current_platform.is_rocm():
         _setup_tilelang_jit_hook()
+
+    _setup_deep_gemm_jit_hook()
 
     logger.info(
         "Kernel JIT monitor activated; monitored JIT compilations during "
@@ -525,6 +534,91 @@ def _setup_tilelang_jit_hook() -> None:
         jit_impl_cls.compile = _compile_with_monitor
 
     _tilelang_hook_installed = True
+
+
+# ------------------------------------------------------------------
+# DeepGEMM JIT compilation hook
+# ------------------------------------------------------------------
+
+# DeepGEMM compiles inside its C++ launch path with no Python hook, blocking
+# the call for seconds. Calls served from its in-memory or on-disk cache return
+# in at most a few milliseconds, so only slow calls are checked for new
+# kernels in the JIT cache.
+_DEEP_GEMM_SLOW_CALL_S = 0.05
+# Cache entries are ``<kernel>.<hash>``; some releases prefix ``kernel.``.
+_DEEP_GEMM_CACHE_ENTRY = re.compile(r"^(?:kernel\.)?(?P<name>.+)\.[0-9a-f]{16,}$")
+
+
+def _list_deep_gemm_cache() -> set[str]:
+    assert _deep_gemm_cache_dir is not None
+    try:
+        return set(os.listdir(_deep_gemm_cache_dir))
+    except OSError:
+        return set()
+
+
+def _format_deep_gemm_shapes(args: tuple[object, ...]) -> str:
+    shapes = []
+    for arg in args:
+        for item in arg if isinstance(arg, (tuple, list)) else (arg,):
+            shape = getattr(item, "shape", None)
+            if shape is not None:
+                shapes.append(tuple(shape))
+    return _safe_repr(shapes, max_len=200)
+
+
+def _check_deep_gemm_compile(entry_point: str, args: tuple[object, ...]) -> None:
+    """Report kernels that DeepGEMM added to its JIT cache."""
+    new_entries = _list_deep_gemm_cache() - _deep_gemm_cached
+    _deep_gemm_cached.update(new_entries)
+    for entry in sorted(new_entries):
+        match = _DEEP_GEMM_CACHE_ENTRY.match(entry)
+        if match is None:
+            continue
+        _handle_jit_event(
+            backend="DeepGEMM",
+            event="kernel JIT compilation",
+            fn_name=match["name"],
+            detail=f"{entry_point}, input shapes {_format_deep_gemm_shapes(args)}",
+        )
+
+
+def _monitor_deep_gemm_call(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    import torch
+
+    def monitored(*args, **kwargs):
+        # Keep a post-warmup recompile tracing the original op.
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
+        start = time.perf_counter()
+        result = fn(*args, **kwargs)
+        if time.perf_counter() - start > _DEEP_GEMM_SLOW_CALL_S:
+            _check_deep_gemm_compile(name, args)
+        return result
+
+    monitored.__name__ = monitored.__qualname__ = name
+    return monitored
+
+
+def _setup_deep_gemm_jit_hook() -> None:
+    """Wrap DeepGEMM entry points to report kernels compiled during a call."""
+    global _deep_gemm_hook_installed, _deep_gemm_cache_dir
+    if _deep_gemm_hook_installed:
+        return
+
+    try:
+        from vllm.utils.deep_gemm import wrap_deep_gemm_entry_points
+    except Exception:
+        logger.debug("DeepGEMM is not available; skipping DeepGEMM JIT monitor.")
+        return
+
+    cache_dir = wrap_deep_gemm_entry_points(_monitor_deep_gemm_call)
+    if cache_dir is None:
+        logger.debug("DeepGEMM was not imported; skipping DeepGEMM JIT monitor.")
+        return
+    _deep_gemm_cache_dir = cache_dir
+    _deep_gemm_cached.update(_list_deep_gemm_cache())
+    _deep_gemm_hook_installed = True
 
 
 @contextlib.contextmanager

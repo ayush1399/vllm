@@ -21,6 +21,9 @@ def _reset_monitor():
         jit_monitor._cutedsl_hook_installed = False
         jit_monitor._tilelang_hook_installed = False
         jit_monitor._tilelang_jitimpl_compile_depth = 0
+        jit_monitor._deep_gemm_hook_installed = False
+        jit_monitor._deep_gemm_cache_dir = None
+        jit_monitor._deep_gemm_cached.clear()
 
     reset()
     yield

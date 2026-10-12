@@ -11,6 +11,7 @@ import importlib
 import os
 from collections.abc import Callable
 from enum import Enum
+from types import ModuleType
 from typing import Any, NoReturn
 
 import torch
@@ -340,6 +341,47 @@ def _lazy_init() -> None:
         _dg, "get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", None
     )
     DeepGemmQuantScaleFMT.init_oracle_cache()
+
+
+def wrap_deep_gemm_entry_points(
+    wrap: Callable[[str, Callable[..., Any]], Callable[..., Any]],
+) -> str | None:
+    """Replace every public DeepGEMM callable with ``wrap(name, fn)``.
+
+    Rebinds the ``deep_gemm`` module attributes, which direct users of
+    ``_import_deep_gemm()`` look up at call time, and the ``_*_impl`` symbols
+    that ``_lazy_init()`` resolved for the wrappers in this module. Does
+    nothing if this process never imported DeepGEMM.
+
+    Returns:
+        The directory DeepGEMM writes compiled kernels to, or ``None`` if
+        nothing was wrapped.
+
+    """
+    if _import_deep_gemm.cache_info().currsize == 0:
+        return None
+    dg = _import_deep_gemm()
+    cache_root = os.environ.get("DG_JIT_CACHE_DIR")
+    if dg is None or not cache_root:
+        return None
+
+    wrapped: dict[int, Callable[..., Any]] = {}
+    for name in dir(dg):
+        fn = getattr(dg, name)
+        if (
+            name.startswith("_")
+            or isinstance(fn, (type, ModuleType))
+            or not callable(fn)
+        ):
+            continue
+        wrapped[id(fn)] = wrap(name, fn)
+        setattr(dg, name, wrapped[id(fn)])
+
+    module_globals = globals()
+    for name, value in list(module_globals.items()):
+        if name.endswith("_impl") and id(value) in wrapped:
+            module_globals[name] = wrapped[id(value)]
+    return os.path.join(cache_root, "cache")
 
 
 def get_num_sms() -> int:
