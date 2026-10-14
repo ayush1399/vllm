@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from transformers import PreTrainedConfig
+from transformers import Gemma4TextConfig, PreTrainedConfig
 
 from tests.models.utils import build_model_context
 from vllm.config.ec_transfer import ECRole, ECTransferConfig
@@ -118,14 +118,35 @@ def _make_mm_prefix_model_config(
     return ModelConfig(model, language_model_only=language_model_only)
 
 
-def test_supports_multimodal_for_mm_prefix_before_multimodal_config():
-    """A text-only model never builds a multimodal config, so the early
-    return must neither clear mm_prefix nor write the sticky cache."""
+def test_supports_multimodal_for_mm_prefix_text_only_model():
+    """A text-only model never builds a multimodal config, so mm_prefix is
+    cleared without querying the registry or writing the sticky cache."""
     model_config = _make_mm_prefix_model_config(_TEXT_ONLY_MODEL)
     assert model_config.multimodal_config is None
 
-    assert model_config._supports_multimodal_for_mm_prefix() is True
+    assert model_config._supports_multimodal_for_mm_prefix() is False
     assert not getattr(model_config, "_supports_multimodal_inputs_cache", None)
+
+
+def test_text_only_gemma4_clears_mm_prefix(tmp_path):
+    """A Gemma4ForCausalLM checkpoint can inherit use_bidirectional_attention
+    from its multimodal parent, but must not veto backends without
+    mm_prefix support since it never sees image tokens."""
+    Gemma4TextConfig(
+        architectures=["Gemma4ForCausalLM"],
+        use_bidirectional_attention="vision",
+        num_hidden_layers=2,
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+    ).save_pretrained(tmp_path)
+
+    model_config = ModelConfig(str(tmp_path))
+
+    assert model_config.multimodal_config is None
+    assert model_config.is_mm_prefix_lm is False
 
 
 def test_language_model_only_disables_via_supports_multimodal_inputs():
