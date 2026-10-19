@@ -90,6 +90,7 @@ class MlpProjectorConfig(PreTrainedConfig):
 
 @strict
 class DeepseekVLV2TextConfig(DeepseekV2Config):
+    num_hidden_layers: int = 30
     kv_lora_rank: int | None = DeepseekV2Config.kv_lora_rank
 
 

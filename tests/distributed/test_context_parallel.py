@@ -16,7 +16,13 @@ import lm_eval
 import pytest
 import torch
 
-from tests.utils import RemoteOpenAIServer, create_new_process_for_each_test
+from tests.conftest import ImageTestAssets, VllmRunner
+from tests.models.utils import check_logprobs_close
+from tests.utils import (
+    RemoteOpenAIServer,
+    create_new_process_for_each_test,
+    large_gpu_mark,
+)
 from vllm.config.model import RunnerOption
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -315,4 +321,69 @@ def test_cp_generation(
         num_gpus_available,
         method="generate",
         is_multimodal=False,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA MLA")
+@large_gpu_mark(min_gb=70)
+@pytest.mark.parametrize(
+    "tp_size",
+    [
+        pytest.param(1, marks=pytest.mark.distributed(num_gpus=2)),
+        pytest.param(2, marks=pytest.mark.distributed(num_gpus=4)),
+    ],
+)
+@create_new_process_for_each_test("spawn")
+def test_deepseek_vl2_multimodal_pcp(
+    vllm_runner: type[VllmRunner],
+    image_assets: ImageTestAssets,
+    monkeypatch,
+    num_gpus_available,
+    tp_size,
+):
+    """PCP preserves image conditioning through chunked prefill and decode."""
+    if num_gpus_available < tp_size * 2:
+        pytest.skip(f"requires {tp_size * 2} GPUs")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    images = [asset.pil_image.resize((384, 384)) for asset in image_assets]
+    prompts = [
+        "<image>\nWhat word is on the sign?",
+        "<image>\n<image>\nDescribe both images briefly.",
+        "What is two plus two?",
+    ]
+    prompts = [f"<|User|>: {prompt}\n\n<|Assistant|>:" for prompt in prompts]
+    outputs = []
+    for pcp_size in (1, 2):
+        with vllm_runner(
+            "deepseek-ai/deepseek-vl2",
+            hf_overrides={"architectures": ["DeepseekVLV2ForCausalLM"]},
+            tensor_parallel_size=tp_size,
+            prefill_context_parallel_size=pcp_size,
+            distributed_executor_backend="mp",
+            enforce_eager=True,
+            enable_prefix_caching=False,
+            enable_chunked_prefill=True,
+            max_model_len=4096,
+            max_num_seqs=3,
+            max_num_batched_tokens=512,
+            limit_mm_per_prompt={"image": 2},
+            dtype="bfloat16",
+        ) as runner:
+            batch_outputs = runner.generate_greedy_logprobs(
+                prompts,
+                max_tokens=16,
+                num_logprobs=5,
+                images=[[images[0]], images[:2], None],
+            )
+            # A single request guarantees idle PCP ranks during decode.
+            batch_outputs += runner.generate_greedy_logprobs(
+                prompts[:1], max_tokens=8, num_logprobs=5, images=[[images[0]]]
+            )
+            outputs.append(batch_outputs)
+    check_logprobs_close(
+        outputs_0_lst=outputs[0],
+        outputs_1_lst=outputs[1],
+        name_0="PCP=1",
+        name_1="PCP=2",
     )

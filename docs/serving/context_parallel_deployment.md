@@ -16,6 +16,25 @@ Depending on the use case, there are two possible strategies:
 
 Both approaches are under active development.
 
+### DeepSeek-VL2 image inputs
+
+The V2 model runner supports DeepSeek-VL2 image inputs with MLA PCP. The vision
+encoder and its output cache are replicated across PCP ranks; each rank inserts
+the image embeddings for its local decoder tokens.
+
+Start an eight-GPU instance with TP=2 and PCP=4:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve deepseek-ai/deepseek-vl2 \
+    --tensor-parallel-size 2 --prefill-context-parallel-size 4 \
+    --enforce-eager --no-enable-prefix-caching --max-model-len 4096 \
+    --limit-mm-per-prompt '{"image": 2}'
+```
+
+The GPU count is TP times PCP. Existing PCP restrictions on dense MLA with DCP
+and on LoRA still apply. DeepSeek-VL2-Tiny uses MHA and is not supported by this
+path. Keep the combined image, text, and output within the 4096-token context.
+
 ## Decode Context Parallel
 
 Due to the auto-regressive nature of decoding, every decoding step needs to compute a small amount of query tokens w.r.t. a large number of key/value tokens stored in the paged KV cache. The core of decode context parallel is how to shard the KV cache across GPUs.

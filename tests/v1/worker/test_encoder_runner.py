@@ -84,6 +84,14 @@ def test_encoder_graph_unsupported_modality_uses_eager_output():
     manager.execute.assert_not_called()
 
 
+def test_idle_pcp_rank_skips_token_embedding_collectives():
+    runner = _make_runner([], [])
+    inputs_embeds = runner.get_inputs_embeds(
+        torch.empty(0, dtype=torch.long), [], torch.empty(0, dtype=torch.bool)
+    )
+    assert inputs_embeds is runner.inputs_embeds
+
+
 def _model_state(cache: EncoderCache) -> MagicMock:
     """A mock ModelState backed by a real EncoderCache."""
     state = MagicMock()
@@ -144,6 +152,25 @@ def _gather(runner: EncoderRunner, *, num_scheduled: int, draft_lookahead: int):
         num_computed_tokens=np.array([0]),
         draft_lookahead=draft_lookahead,
     )
+
+
+def test_pcp_segments_preserve_media_embedding_rows():
+    """Repeated request segments use absolute offsets into cached image rows."""
+    features = [_feature("image", 1, 10)]
+    runner = _make_runner(features, features)
+    runner.encoder_cache.mm_features["text"] = []
+    embeds, mask = runner.gather_mm_embeddings(
+        req_ids=["req0", "req0", "text"],
+        total_num_scheduled_tokens=9,
+        num_scheduled_tokens=np.array([3, 4, 2]),
+        query_start_loc=np.array([0, 3, 7]),
+        prefill_lens=np.array([12, 12, 2]),
+        num_computed_tokens=np.array([0, 8, 0]),
+    )
+    cached = runner.encoder_cache.encoder_outputs["image"]
+    torch.testing.assert_close(embeds[0], cached[:2])
+    torch.testing.assert_close(embeds[1], cached[7:10])
+    assert mask.tolist() == [False, True, True, True, True, True, False, False, False]
 
 
 def test_draft_lookahead_uses_boundary_feature_when_cached():

@@ -37,6 +37,7 @@ def _make_config(cudagraph_mode: CUDAGraphMode):
         model_config=SimpleNamespace(
             use_mla=True,
             is_encoder_decoder=False,
+            architecture="DeepseekVLV2ForCausalLM",
             hf_text_config=SimpleNamespace(),
         ),
         lora_config=None,
@@ -77,6 +78,19 @@ def test_validate_config_rejects_full_graph_for_prefills():
         PCPManager.validate_config(
             _make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+def test_validate_config_accepts_vl2_multimodal_pcp():
+    PCPManager.validate_config(
+        _make_config(CUDAGraphMode.NONE), supports_mm_inputs=True
+    )
+
+
+def test_validate_config_rejects_other_multimodal_models():
+    config = _make_config(CUDAGraphMode.NONE)
+    config.model_config.architecture = "KimiK25ForConditionalGeneration"
+    with pytest.raises(NotImplementedError, match="DeepSeek-VL2 only"):
+        PCPManager.validate_config(config, supports_mm_inputs=True)
 
 
 @pytest.mark.parametrize("draft_uses_mla", [False, True])

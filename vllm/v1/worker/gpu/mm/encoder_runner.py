@@ -300,6 +300,9 @@ class EncoderRunner:
         mm_embeds: list[torch.Tensor],
         is_mm_embed: torch.Tensor,
     ) -> torch.Tensor:
+        # Idle PCP ranks must not launch empty TP embedding collectives.
+        if input_ids.numel() == 0:
+            return self.inputs_embeds
         x = self.model.embed_input_ids(
             input_ids, multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
         )

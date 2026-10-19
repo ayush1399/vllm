@@ -27,6 +27,16 @@ from vllm.transformers_utils.config import (
 from vllm.transformers_utils.configs.mistral import adapt_config_dict
 
 
+@pytest.mark.parametrize("layers", [None, 12, 27])
+def test_deepseek_vl2_preserves_checkpoint_layer_count(layers):
+    """Full VL2 omits its 30-layer default; Tiny and Small override it."""
+    from vllm.transformers_utils.configs.deepseek_vl2 import DeepseekVLV2Config
+
+    language_config = {} if layers is None else {"num_hidden_layers": layers}
+    config = DeepseekVLV2Config(language_config=language_config)
+    assert config.text_config.num_hidden_layers == (30 if layers is None else layers)
+
+
 @pytest.mark.parametrize("layout", ["mixed", "flat"])
 def test_gemma4_dspark_rope_config_preserves_parameters(tmp_path, layout):
     """Remove redundant shared entries while preserving per-layer and flat RoPE."""
