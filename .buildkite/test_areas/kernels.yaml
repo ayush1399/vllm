@@ -38,6 +38,7 @@ steps:
   source_file_dependencies:
   - csrc/
   - tests/kernels/core
+  - vllm/model_executor/layers/gemma4_full_chain.py
   - tests/kernels/test_concat_mla_q.py
   - tests/kernels/test_fused_qk_norm_rope_gate.py
   commands:
@@ -594,6 +595,7 @@ steps:
   - tools/setup_deepgemm_pythons.sh
   - tools/check_wheel_deepgemm.py
   - vllm/utils/deep_gemm.py
+  - vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py
   - vllm/model_executor/layers/fused_moe
   - vllm/model_executor/layers/quantization
   - tests/kernels/quantization/test_block_fp8.py

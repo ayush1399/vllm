@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import sys
 from abc import ABC, abstractmethod
 from bisect import bisect_left
 
 import tokenizers.decoders
 from tokenizers import Tokenizer
+from tokenizers.tokenizers import decoders as native_decoders
 from transformers import TokenizersBackend
 
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import (
+    INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET,
     convert_prompt_ids_to_tokens,
     detokenize_incrementally,
 )
@@ -21,6 +24,52 @@ logger = init_logger(__name__)
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+
+
+def _get_decode_stream_prompt_ids(
+    tokenizer: Tokenizer,
+    prompt_token_ids: list[int] | None,
+    skip_special_tokens: bool,
+) -> list[int] | None:
+    """Bound native prompt priming when a visible tail flushes older byte runs."""
+    tail_length = INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET + 2
+    if (
+        prompt_token_ids is None
+        or len(prompt_token_ids) <= tail_length
+        or type(tokenizer) is not Tokenizer
+        or tokenizers.decoders.DecodeStream is not native_decoders.DecodeStream
+        or tokenizers.decoders.DecodeStream.__module__ != "tokenizers.decoders"
+    ):
+        return prompt_token_ids
+
+    try:
+        decoder = json.loads(tokenizer.decoder.__getstate__())
+    except Exception:
+        # Custom Python decoders can work without supporting serialization.
+        return prompt_token_ids
+    if decoder != {
+        "type": "Sequence",
+        "decoders": [
+            {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+            {"type": "ByteFallback"},
+            {"type": "Fuse"},
+        ],
+    }:
+        return prompt_token_ids
+    try:
+        tail = prompt_token_ids[-tail_length:]
+        tokens = [tokenizer.id_to_token(token_id) for token_id in tail]
+        if any(
+            not isinstance(token, str) or not token or token.startswith("<0x")
+            for token in tokens
+        ):
+            return prompt_token_ids
+        decoded = tokenizer.decode(tail, skip_special_tokens=skip_special_tokens)
+        if not decoded or decoded.endswith("\ufffd"):
+            return prompt_token_ids
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return prompt_token_ids
+    return tail
 
 
 def uses_fast_detokenizer(tokenizer: TokenizerLike) -> bool:
@@ -193,7 +242,9 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=_get_decode_stream_prompt_ids(
+                self.tokenizer, request.prompt_token_ids, self.skip_special_tokens
+            ),
             skip_special_tokens=self.skip_special_tokens,
         )
 

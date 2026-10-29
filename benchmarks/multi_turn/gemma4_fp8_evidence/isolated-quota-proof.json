@@ -1,0 +1,26 @@
+{
+  "state": "CPU_ISOLATED_COUNTS_AND_DEFAULT_PAYLOAD_PARITY_PASS",
+  "old_helper_sha256": "8314b5a9adc358cc5cb0a9a380d74e414bd6b1f028b3c31d2db9c9cd3952fc27",
+  "new_helper_sha256": "0c8074aa8987e225d60e6fa0f3029ebda4710b0e6743e06030a505442f6f814e",
+  "default_call_prompt_hashes_ids_outputs_and_result_exact": true,
+  "default_calls_including_setups": 48,
+  "final_calls_including_setups": 1233,
+  "final_counts": {
+    "800": {
+      "warmup": 10,
+      "measured": 400
+    },
+    "8192": {
+      "warmup": 10,
+      "measured": 400
+    },
+    "18304": {
+      "warmup": 10,
+      "measured": 400
+    }
+  },
+  "transport": "In-process fake; real helper run/real measured-client prompt_hash",
+  "model_or_HTTP_or_GPU": false,
+  "torch_imported": false,
+  "scope": "Counts/payload assembly only; not latency/cache-server correctness."
+}

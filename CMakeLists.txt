@@ -479,6 +479,16 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     list(APPEND VLLM_STABLE_EXT_SRC
       "csrc/fused_qknorm_rope_cache_kernel.cu")
+    cuda_archs_loose_intersection(GEMMA4_FULL_CHAIN_ARCHS "9.0" "${CUDA_ARCHS}")
+    if(GEMMA4_FULL_CHAIN_ARCHS AND
+       CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+      set(GEMMA4_FULL_CHAIN_SRC
+        "csrc/quantization/fused_kernels/gemma4_full_chain.cu")
+      list(APPEND VLLM_STABLE_EXT_SRC "${GEMMA4_FULL_CHAIN_SRC}")
+      set_gencode_flags_for_srcs(
+        SRCS "${GEMMA4_FULL_CHAIN_SRC}"
+        CUDA_ARCHS "${GEMMA4_FULL_CHAIN_ARCHS}")
+    endif()
   endif()
 
   if(VLLM_GPU_LANG STREQUAL "CUDA" AND
