@@ -1,0 +1,525 @@
+{
+  "state": "HISTORICAL_PROTOTYPE_EVIDENCE_FINAL_INTEGRATED_VALIDATION_PENDING",
+  "goal_acceptance": false,
+  "base": "274a5e19a18460ed41d47117398494b721e3df16",
+  "rows": [
+    {
+      "profile": "native_fp8_historical",
+      "concurrency": 4,
+      "case": "warm",
+      "turns": 24,
+      "measured": 84,
+      "warm_count": 84,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 32.96405,
+        "p95": 42.44829364999999
+      },
+      "all_tpot_ms": {
+        "p50": 6.194066797137847,
+        "p95": 6.289673436481143
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "native_fp8_historical",
+      "concurrency": 4,
+      "case": "mixed",
+      "turns": 24,
+      "measured": 84,
+      "warm_count": 80,
+      "cold_count": 4,
+      "warm_ttft_ms": {
+        "p50": 33.0557705,
+        "p95": 85.16661235
+      },
+      "all_tpot_ms": {
+        "p50": 6.261091252418193,
+        "p95": 7.635416179473684
+      },
+      "cold_ttft_ms": {
+        "p50": 162.9054865,
+        "p95": 163.08694889999998
+      },
+      "query800_ttft_ms": {
+        "p50": 84.3531135,
+        "p95": 92.62506855000001
+      }
+    },
+    {
+      "profile": "native_fp8_historical",
+      "concurrency": 13,
+      "case": "warm",
+      "turns": 24,
+      "measured": 273,
+      "warm_count": 273,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 34.739637,
+        "p95": 49.22815959999999
+      },
+      "all_tpot_ms": {
+        "p50": 7.425593359649123,
+        "p95": 7.5721222526530605
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "native_fp8_historical",
+      "concurrency": 13,
+      "case": "mixed",
+      "turns": 24,
+      "measured": 273,
+      "warm_count": 262,
+      "cold_count": 11,
+      "warm_ttft_ms": {
+        "p50": 35.1845365,
+        "p95": 89.38050109999999
+      },
+      "all_tpot_ms": {
+        "p50": 8.470889584269663,
+        "p95": 10.423155654750035
+      },
+      "cold_ttft_ms": {
+        "p50": 167.124804,
+        "p95": 202.864899
+      },
+      "query800_ttft_ms": {
+        "p50": 80.358068,
+        "p95": 96.2842454
+      }
+    },
+    {
+      "profile": "native_fp8_historical",
+      "concurrency": 57,
+      "case": "warm",
+      "turns": 24,
+      "measured": 1197,
+      "warm_count": 1197,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 60.744041,
+        "p95": 98.70737720000004
+      },
+      "all_tpot_ms": {
+        "p50": 12.595606142857143,
+        "p95": 13.257417690213723
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "native_fp8_historical",
+      "concurrency": 57,
+      "case": "mixed",
+      "turns": 24,
+      "measured": 1197,
+      "warm_count": 1160,
+      "cold_count": 37,
+      "warm_ttft_ms": {
+        "p50": 70.195142,
+        "p95": 197.49989975
+      },
+      "all_tpot_ms": {
+        "p50": 16.58602468141593,
+        "p95": 19.16744502261072
+      },
+      "cold_ttft_ms": {
+        "p50": 196.849066,
+        "p95": 229.82274199999998
+      },
+      "query800_ttft_ms": {
+        "p50": 112.049391,
+        "p95": 233.16724359999995
+      }
+    },
+    {
+      "profile": "native_bf16_historical",
+      "concurrency": 4,
+      "case": "warm",
+      "turns": 24,
+      "measured": 84,
+      "warm_count": 84,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 32.547863,
+        "p95": 42.56780379999998
+      },
+      "all_tpot_ms": {
+        "p50": 6.879604560435571,
+        "p95": 6.966207907632951
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "native_bf16_historical",
+      "concurrency": 4,
+      "case": "mixed",
+      "turns": 24,
+      "measured": 84,
+      "warm_count": 80,
+      "cold_count": 4,
+      "warm_ttft_ms": {
+        "p50": 33.212906000000004,
+        "p95": 59.8691331
+      },
+      "all_tpot_ms": {
+        "p50": 6.938285862139535,
+        "p95": 8.33065516012328
+      },
+      "cold_ttft_ms": {
+        "p50": 191.532072,
+        "p95": 202.5171757
+      },
+      "query800_ttft_ms": {
+        "p50": 57.4030575,
+        "p95": 60.3995583
+      }
+    },
+    {
+      "profile": "native_bf16_historical",
+      "concurrency": 13,
+      "case": "warm",
+      "turns": 24,
+      "measured": 273,
+      "warm_count": 273,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 35.023756,
+        "p95": 47.028310999999995
+      },
+      "all_tpot_ms": {
+        "p50": 7.980537715384615,
+        "p95": 8.141162178806601
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "native_bf16_historical",
+      "concurrency": 13,
+      "case": "mixed",
+      "turns": 24,
+      "measured": 273,
+      "warm_count": 262,
+      "cold_count": 11,
+      "warm_ttft_ms": {
+        "p50": 35.058746,
+        "p95": 64.69471694999999
+      },
+      "all_tpot_ms": {
+        "p50": 8.50424206140351,
+        "p95": 10.867593074687498
+      },
+      "cold_ttft_ms": {
+        "p50": 191.644687,
+        "p95": 210.17053750000002
+      },
+      "query800_ttft_ms": {
+        "p50": 57.9229835,
+        "p95": 83.44215664999999
+      }
+    },
+    {
+      "profile": "native_bf16_historical",
+      "concurrency": 57,
+      "case": "warm",
+      "turns": 24,
+      "measured": 1197,
+      "warm_count": 1197,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 58.787072,
+        "p95": 90.8882664
+      },
+      "all_tpot_ms": {
+        "p50": 13.084854472727274,
+        "p95": 13.383233558910588
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "native_bf16_historical",
+      "concurrency": 57,
+      "case": "mixed",
+      "turns": 24,
+      "measured": 1197,
+      "warm_count": 1160,
+      "cold_count": 37,
+      "warm_ttft_ms": {
+        "p50": 63.921224499999994,
+        "p95": 211.57841819999996
+      },
+      "all_tpot_ms": {
+        "p50": 16.41175763809524,
+        "p95": 19.188451102967445
+      },
+      "cold_ttft_ms": {
+        "p50": 217.753157,
+        "p95": 258.34413499999994
+      },
+      "query800_ttft_ms": {
+        "p50": 81.906689,
+        "p95": 235.51053079999988
+      }
+    },
+    {
+      "profile": "prototype_v7_fp8",
+      "concurrency": 4,
+      "case": "warm",
+      "turns": 107,
+      "measured": 416,
+      "warm_count": 416,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 25.342981,
+        "p95": 32.39187225
+      },
+      "all_tpot_ms": {
+        "p50": 5.939872875096302,
+        "p95": 6.011439680159705
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "prototype_v7_fp8",
+      "concurrency": 4,
+      "case": "mixed",
+      "turns": 107,
+      "measured": 416,
+      "warm_count": 402,
+      "cold_count": 14,
+      "warm_ttft_ms": {
+        "p50": 25.50694,
+        "p95": 38.1964023
+      },
+      "all_tpot_ms": {
+        "p50": 5.996529889583334,
+        "p95": 7.191002509061625
+      },
+      "cold_ttft_ms": {
+        "p50": 155.4219415,
+        "p95": 156.2658734
+      },
+      "query800_ttft_ms": {
+        "p50": 37.9340145,
+        "p95": 43.12215095
+      }
+    },
+    {
+      "profile": "prototype_v7_fp8",
+      "concurrency": 13,
+      "case": "warm",
+      "turns": 40,
+      "measured": 481,
+      "warm_count": 481,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 27.767307,
+        "p95": 38.495516
+      },
+      "all_tpot_ms": {
+        "p50": 7.285574876033058,
+        "p95": 7.412066421487603
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "prototype_v7_fp8",
+      "concurrency": 13,
+      "case": "mixed",
+      "turns": 40,
+      "measured": 481,
+      "warm_count": 464,
+      "cold_count": 17,
+      "warm_ttft_ms": {
+        "p50": 28.411379500000002,
+        "p95": 47.37830839999998
+      },
+      "all_tpot_ms": {
+        "p50": 7.59611496491228,
+        "p95": 9.604474483050847
+      },
+      "cold_ttft_ms": {
+        "p50": 158.516412,
+        "p95": 169.5257896
+      },
+      "query800_ttft_ms": {
+        "p50": 40.869449,
+        "p95": 62.006927599999976
+      }
+    },
+    {
+      "profile": "prototype_v7_fp8",
+      "concurrency": 57,
+      "case": "warm",
+      "turns": 24,
+      "measured": 1197,
+      "warm_count": 1197,
+      "cold_count": 0,
+      "warm_ttft_ms": {
+        "p50": 43.732212,
+        "p95": 55.895109
+      },
+      "all_tpot_ms": {
+        "p50": 12.233596970149254,
+        "p95": 12.376612135286937
+      },
+      "cold_ttft_ms": null,
+      "query800_ttft_ms": null
+    },
+    {
+      "profile": "prototype_v7_fp8",
+      "concurrency": 57,
+      "case": "mixed",
+      "turns": 24,
+      "measured": 1197,
+      "warm_count": 1160,
+      "cold_count": 37,
+      "warm_ttft_ms": {
+        "p50": 49.169252,
+        "p95": 81.25449369999998
+      },
+      "all_tpot_ms": {
+        "p50": 14.925013346153847,
+        "p95": 17.30150893779998
+      },
+      "cold_ttft_ms": {
+        "p50": 183.359611,
+        "p95": 314.4973448
+      },
+      "query800_ttft_ms": {
+        "p50": 60.284127,
+        "p95": 83.12648079999992
+      }
+    }
+  ],
+  "sources": [
+    {
+      "id": "default-v2-ref-fp8/c4-requests.json",
+      "sha256": "4f12a62d53f4df540abca4b524dc751310a07c0513ff2dd8e39ddb39fd11e89b"
+    },
+    {
+      "id": "default-v2-ref-fp8/c13-requests.json",
+      "sha256": "f6a9064e37fae495d4d25e0d4c06601f00bc01b64f5a2a5c76783e6c5fb8984a"
+    },
+    {
+      "id": "default-v2-ref-fp8/c57-requests.json",
+      "sha256": "42f8c344075ecc5cd9c08b1f442ae254e7cb9ad11711f33f21fc4d3d73f56817"
+    },
+    {
+      "id": "default-v2-ref-bf16/c4-requests.json",
+      "sha256": "a23d7a4daef80fe73b7d440685a3a17518f110a7b2021f04c8514e641668d107"
+    },
+    {
+      "id": "default-v2-ref-bf16/c13-requests.json",
+      "sha256": "758c1333f6c1d245541c0df7b8c9c81e23fdc0a0c44db83685bf83d8b5c83bee"
+    },
+    {
+      "id": "default-v2-ref-bf16/c57-requests.json",
+      "sha256": "03fe3109520ec6bf18f70b6072e1764c3310f66abff1a87f1569ec2fc6586270"
+    },
+    {
+      "id": "g4-carry-v1-1-fp8/c4-requests.json",
+      "sha256": "2e5a8fb487ca717fa656d130998b69f9b631d9fe1265cdb68675d58645084084"
+    },
+    {
+      "id": "g4-carry-v1-1-fp8/c13-requests.json",
+      "sha256": "e091d5dd716d8306d07195dd48c8039cadf005d9acc87734ef6a51729f462f69"
+    },
+    {
+      "id": "g4-carry-v1-1-fp8/c57-requests.json",
+      "sha256": "8091f91681ca06db3c607e4402a2775c201e51c27ba5deb4d2959f26f3b4ae4f"
+    }
+  ],
+  "isolated_v7": {
+    "80": {
+      "ttft_ms": {
+        "p50": 23.553114,
+        "p95": 24.15983015,
+        "p99": 24.53930562
+      },
+      "historical_native_fp8_change_percent": null
+    },
+    "800": {
+      "ttft_ms": {
+        "p50": 36.33981,
+        "p95": 37.12967225,
+        "p99": 37.5171555
+      },
+      "historical_native_fp8_change_percent": {
+        "p50": -52.28360452271335,
+        "p95": -52.518534009725684,
+        "p99": -52.0755428555267
+      }
+    },
+    "8192": {
+      "ttft_ms": {
+        "p50": 176.555817,
+        "p95": 178.27513390000001,
+        "p99": 179.19787443
+      },
+      "historical_native_fp8_change_percent": {
+        "p50": -8.080853301448387,
+        "p95": -9.274214692829707,
+        "p99": -9.014232610933327
+      }
+    },
+    "18304": {
+      "ttft_ms": {
+        "p50": 394.46536449999996,
+        "p95": 396.6827599,
+        "p99": 397.76068002
+      },
+      "historical_native_fp8_change_percent": {
+        "p50": -5.67626350248368,
+        "p95": -6.544851811660601,
+        "p99": -6.369069270593064
+      }
+    }
+  },
+  "quality": {
+    "prototype_v7": {
+      "n": 1319,
+      "established": 1278,
+      "strict": 1258,
+      "errors": 0,
+      "truncations": 0,
+      "source_id": "g4-v7q1-fp8/gsm8k.json",
+      "sha256": "78bbfe707562bba937da23b4f4a3b89abe520df3db59a05b266696b07530d2f9"
+    },
+    "reference_corrected_v2_flagoff_fp8": {
+      "n": 1319,
+      "established": 1276,
+      "strict": 1256,
+      "source_id": "g4-corrected-v2-0-fp8/gsm8k.json",
+      "sha256": "efab2b0c75250db2dd9eec7138d361cc51a03444d89b0ff470f894bc49f748bf"
+    },
+    "paired_established_wins": 3,
+    "paired_established_losses": 1,
+    "statistical_gain_or_equivalence_claim": false
+  },
+  "caveats": [
+    "Prototype V7 uses historical C6+ctypes chain; new normal native integration is separate.",
+    "Native FP8/BF16 are older runs at FULL_AND_PIECEWISE512/default maxseq, turns24; V7 uses FULL32768/maxseq64, C4turn107/C13turn40/C57turn24. Dynamic batch windows are not matched.",
+    "This is descriptive historical evidence, not fresh paired restart acceptance.",
+    "C57cold tail retained separately and nonblocking per user; no fusion-causality claim."
+  ],
+  "dependency_scope": {
+    "hardware": "8xH100 TP8",
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
+    "attention": "FLASH_ATTN version4, vllm-project fork",
+    "flash_attention_revision": "b273a02621d3c94bc747df67204f591b67f38fae",
+    "torch": "2.14.0+cu132",
+    "flashinfer": "0.7.2.post1",
+    "speculation": "disabled; no MTP"
+  },
+  "new_integrated_build_kernel_model_quality_restarts": "PENDING completed additive evidence; not inferred from this package"
+}

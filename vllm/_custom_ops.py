@@ -463,6 +463,7 @@ def rms_norm_per_block_quant(
     residual: torch.Tensor | None = None,
     is_scale_transposed: bool = False,
     tma_alignment: int = 0,
+    scale_ue8m0: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert len(group_size) == 2
     output = torch.empty(input.shape, dtype=quant_dtype, device=input.device)
@@ -507,6 +508,7 @@ def rms_norm_per_block_quant(
         residual,
         group_size[1],
         is_scale_transposed,
+        scale_ue8m0,
     )
     return output, scales
 
@@ -3177,6 +3179,7 @@ def cp_gather_and_upconvert_nvfp4_kv_cache(
     block_table: torch.Tensor,
     workspace_starts: torch.Tensor,
     batch_size: int,
+    seq_starts: torch.Tensor | None = None,
 ) -> None:
     """Gather and upconvert an nvfp4_ds_mla KV cache to a BF16 workspace.
 
@@ -3186,6 +3189,8 @@ def cp_gather_and_upconvert_nvfp4_kv_cache(
         block_table: Block indices [num_reqs, max_blocks]
         workspace_starts: Workspace start offsets [num_reqs]
         batch_size: Number of requests
+        seq_starts: Per-request token offset into the context to start
+            reading from [num_reqs]; None reads from the first token.
 
     """
     torch.ops._C_cache_ops.cp_gather_and_upconvert_nvfp4_kv_cache(
@@ -3194,6 +3199,7 @@ def cp_gather_and_upconvert_nvfp4_kv_cache(
         block_table,
         workspace_starts,
         batch_size,
+        seq_starts,
     )
 
 

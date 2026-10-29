@@ -1,0 +1,4 @@
+{
+  "cudagraph_mode": "FULL_AND_PIECEWISE",
+  "max_cudagraph_capture_size": 512
+}

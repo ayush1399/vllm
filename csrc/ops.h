@@ -225,14 +225,22 @@ void rms_norm_dynamic_per_token_quant(
     double const var_epsilon, std::optional<torch::stable::Tensor> scale_ub,
     std::optional<torch::stable::Tensor> residual);
 
-void rms_norm_per_block_quant(torch::stable::Tensor& out,
-                              torch::stable::Tensor const& input,
-                              torch::stable::Tensor const& weight,
-                              torch::stable::Tensor& scales,
-                              double const var_epsilon,
-                              std::optional<torch::stable::Tensor> scale_ub,
-                              std::optional<torch::stable::Tensor> residual,
-                              int64_t group_size, bool is_scale_transposed);
+void gemma4_full_chain_out(torch::stable::Tensor const& input,
+                           torch::stable::Tensor const& residual,
+                           torch::stable::Tensor const& post_weight,
+                           torch::stable::Tensor const& pre_weight,
+                           torch::stable::Tensor const& scalar,
+                           torch::stable::Tensor& carry,
+                           torch::stable::Tensor& output,
+                           torch::stable::Tensor& scales, int64_t mode,
+                           double epsilon);
+
+void rms_norm_per_block_quant(
+    torch::stable::Tensor& out, torch::stable::Tensor const& input,
+    torch::stable::Tensor const& weight, torch::stable::Tensor& scales,
+    double const var_epsilon, std::optional<torch::stable::Tensor> scale_ub,
+    std::optional<torch::stable::Tensor> residual, int64_t group_size,
+    bool is_scale_transposed, bool scale_ue8m0);
 
 void silu_and_mul_per_block_quant(torch::stable::Tensor& out,
                                   torch::stable::Tensor const& input,
@@ -826,7 +834,8 @@ void cp_gather_and_upconvert_nvfp4_kv_cache(
     torch::stable::Tensor const& dst,               // [TOT_TOKENS, 576]
     torch::stable::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
     torch::stable::Tensor const& workspace_starts,  // [BATCH]
-    int64_t batch_size);
+    int64_t batch_size,
+    std::optional<torch::stable::Tensor> seq_starts = std::nullopt);
 
 // Indexer K quantization and cache function
 void indexer_k_quant_and_cache(

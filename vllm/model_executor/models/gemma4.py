@@ -25,6 +25,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.utils import getattr_iter
@@ -45,6 +46,16 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.router.base_router import (
     get_moe_padding_mask,
 )
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    get_input_quant_key,
+)
+from vllm.model_executor.layers.gemma4_full_chain import (
+    full_chain as _gemma4_full_chain_op,  # noqa: F401
+)
+from vllm.model_executor.layers.gemma4_full_chain import (
+    native_available as _gemma4_full_chain_native_available,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -55,6 +66,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynamic128Sym
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -63,6 +75,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
 from .interfaces import (
@@ -84,6 +98,79 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _gemma4_hybrid_rms_quant(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, hidden = x.shape
+    result = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale_storage = torch.empty(
+        (hidden // 128, round_up(m, 4)), device=x.device, dtype=torch.float32
+    )
+    scales = scale_storage[:, :m].t()
+    if m < 32:
+        from flashinfer.gemm.gemm_base import get_fp8_blockscale_gemm_runner_sm90
+
+        normalized = torch.empty_like(x)
+        torch.ops._C.rms_norm(normalized, x, weight, epsilon)
+        get_fp8_blockscale_gemm_runner_sm90().fp8_quantize_1x128(
+            normalized, result, scale_storage, False
+        )
+    else:
+        torch.ops._C.rms_norm_per_block_quant(
+            result, x, weight, scales, epsilon, None, None, 128, True, True
+        )
+    return result, scales
+
+
+def _gemma4_hybrid_rms_quant_fake(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, hidden = x.shape
+    result = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale_storage = torch.empty(
+        (hidden // 128, round_up(m, 4)), device=x.device, dtype=torch.float32
+    )
+    return result, scale_storage[:, :m].t()
+
+
+direct_register_custom_op(
+    "gemma4_hybrid_rms_quant",
+    _gemma4_hybrid_rms_quant,
+    fake_impl=_gemma4_hybrid_rms_quant_fake,
+    tags=(torch.Tag.needs_exact_strides,),
+)
+
+
+def _maybe_gemma4_hybrid_norm_quant(
+    norm: RMSNorm, x: torch.Tensor, linear: torch.nn.Module
+) -> torch.Tensor | QuantizedActivation:
+    key = get_input_quant_key(linear)
+    if (
+        key != kFp8Dynamic128Sym
+        or not getattr(linear, "_flashinfer_fp8_input_ue8m0", False)
+        or envs.VLLM_BATCH_INVARIANT
+        or type(norm) is not RMSNorm
+        or not norm.has_weight
+        or norm.variance_size_override is not None
+        or x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or norm.weight.dtype != x.dtype
+        or not x.is_contiguous()
+        or x.shape[-1] % 128 != 0
+    ):
+        return norm(x)
+    data, scale = torch.ops.vllm.gemma4_hybrid_rms_quant(
+        x, norm.weight, norm.variance_epsilon
+    )
+    return QuantizedActivation(
+        data=data,
+        scale=scale,
+        orig_dtype=x.dtype,
+        orig_shape=x.shape,
+        quant_key=key,
+    )
 
 
 def _gemma4_layer_weights_mapper(config) -> WeightsMapper:
@@ -295,7 +382,7 @@ class Gemma4MLP(nn.Module):
         )
         self.act_fn = get_act_and_mul_fn(hidden_activation)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor | QuantizedActivation) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -540,7 +627,7 @@ class Gemma4Attention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | QuantizedActivation,
         **kwargs,
     ) -> torch.Tensor:
         if self.is_kv_shared_layer:
@@ -647,6 +734,12 @@ class Gemma4DecoderLayer(nn.Module):
 
         # MoE (Mixture of Experts) — router + expert block parallel to MLP
         self.enable_moe_block = getattr(config, "num_experts", None) is not None
+        self._fuse_norm_quant = (
+            envs.VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT
+            and current_platform.is_device_capability(90)
+            and not self.enable_moe_block
+            and not self.self_attn.is_kv_shared_layer
+        )
         self.router: Gemma4Router | None
         self.experts: MoERunner | None
         self.post_feedforward_layernorm_1: RMSNorm | None
@@ -740,7 +833,12 @@ class Gemma4DecoderLayer(nn.Module):
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(residual)
+        if self._fuse_norm_quant:
+            hidden_states = _maybe_gemma4_hybrid_norm_quant(
+                self.input_layernorm, residual, self.self_attn.qkv_proj
+            )
+        else:
+            hidden_states = self.input_layernorm(residual)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -753,7 +851,14 @@ class Gemma4DecoderLayer(nn.Module):
         residual = hidden_states
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        if self._fuse_norm_quant:
+            hidden_states = _maybe_gemma4_hybrid_norm_quant(
+                self.pre_feedforward_layernorm,
+                hidden_states,
+                self.mlp.gate_up_proj,
+            )
+        else:
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
@@ -793,6 +898,143 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = hidden_states * self.layer_scalar
 
         return hidden_states, None
+
+
+def _gemma4_full_chain_norm_supported(norm: RMSNorm, device) -> bool:
+    return (
+        type(norm) is RMSNorm
+        and norm.has_weight
+        and norm.pass_weight
+        and norm.variance_size_override is None
+        and norm.hidden_size == 5376
+        and norm.variance_epsilon == 1e-6
+        and norm.weight.dtype == torch.bfloat16
+        and norm.weight.shape == (5376,)
+        and norm.weight.is_contiguous()
+        and norm.weight.device == device
+    )
+
+
+def _gemma4_full_chain_linear_supported(linear: nn.Module) -> bool:
+    return (
+        get_input_quant_key(linear) == kFp8Dynamic128Sym
+        and getattr(linear, "_flashinfer_fp8_input_ue8m0", False) is True
+    )
+
+
+def _gemma4_can_run_full_chain(
+    model: "Gemma4Model",
+    hidden_states: torch.Tensor,
+    per_layer_inputs: torch.Tensor | None,
+) -> bool:
+    if (
+        not model._full_chain_config_supported
+        or model.fast_prefill_enabled
+        or model.aux_hidden_state_layers
+        or per_layer_inputs is not None
+        or model.start_layer != 0
+        or model.end_layer != 60
+        or len(model.layers) != 60
+        or hidden_states.ndim != 2
+        or hidden_states.shape[-1] != 5376
+        or hidden_states.shape[0] == 0
+        or hidden_states.dtype != torch.bfloat16
+        or hidden_states.device.type != "cuda"
+        or not hidden_states.is_contiguous()
+        or not _gemma4_full_chain_norm_supported(model.norm, hidden_states.device)
+    ):
+        return False
+    for layer in model.layers:
+        if (
+            type(layer) is not Gemma4DecoderLayer
+            or type(layer.self_attn) is not Gemma4Attention
+            or type(layer.mlp) is not Gemma4MLP
+            or not layer._fuse_norm_quant
+            or layer.enable_moe_block
+            or layer.self_attn.is_kv_shared_layer
+            or layer.per_layer_input_gate is not None
+            or layer.per_layer_projection is not None
+            or layer.post_per_layer_input_norm is not None
+            or not _gemma4_full_chain_linear_supported(layer.self_attn.qkv_proj)
+            or not _gemma4_full_chain_linear_supported(layer.mlp.gate_up_proj)
+            or layer.layer_scalar.dtype != torch.bfloat16
+            or layer.layer_scalar.numel() != 1
+            or not layer.layer_scalar.is_contiguous()
+            or layer.layer_scalar.device != hidden_states.device
+        ):
+            return False
+        for norm in (
+            layer.input_layernorm,
+            layer.post_attention_layernorm,
+            layer.pre_feedforward_layernorm,
+            layer.post_feedforward_layernorm,
+        ):
+            if not _gemma4_full_chain_norm_supported(norm, hidden_states.device):
+                return False
+    return True
+
+
+def _gemma4_full_chain_activation(
+    data: torch.Tensor, scale: torch.Tensor
+) -> QuantizedActivation:
+    return QuantizedActivation(
+        data=data,
+        scale=scale,
+        orig_dtype=torch.bfloat16,
+        orig_shape=data.shape,
+        quant_key=kFp8Dynamic128Sym,
+    )
+
+
+def _gemma4_run_full_chain(
+    model: "Gemma4Model",
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    **kwargs,
+) -> torch.Tensor:
+    first = model.layers[0]
+    activation = _maybe_gemma4_hybrid_norm_quant(
+        first.input_layernorm, hidden_states, first.self_attn.qkv_proj
+    )
+    assert isinstance(activation, QuantizedActivation)
+    carry = hidden_states
+    for index, layer in enumerate(model.layers):
+        attention_out = layer.self_attn(
+            positions=positions, hidden_states=activation, **kwargs
+        )
+        residual, data, scale = torch.ops.vllm.gemma4_full_chain(
+            attention_out,
+            carry,
+            layer.post_attention_layernorm.weight,
+            layer.pre_feedforward_layernorm.weight,
+            layer.layer_scalar,
+            0 if index == 0 else 1,
+            1e-6,
+        )
+        feedforward_out = layer.mlp(_gemma4_full_chain_activation(data, scale))
+        if index + 1 == len(model.layers):
+            _, normalized, _ = torch.ops.vllm.gemma4_full_chain(
+                feedforward_out,
+                residual,
+                layer.post_feedforward_layernorm.weight,
+                model.norm.weight,
+                layer.layer_scalar,
+                5,
+                1e-6,
+            )
+            return normalized
+        next_layer = model.layers[index + 1]
+        carry, data, scale = torch.ops.vllm.gemma4_full_chain(
+            feedforward_out,
+            residual,
+            layer.post_feedforward_layernorm.weight,
+            next_layer.input_layernorm.weight,
+            layer.layer_scalar,
+            2,
+            1e-6,
+        )
+        activation = _gemma4_full_chain_activation(data, scale)
+    raise AssertionError("Full-chain eligibility requires 60 decoder layers")
 
 
 def _run_decoder_layers(
@@ -1014,6 +1256,25 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         self.config = config
         self.quant_config = quant_config
         self.hf_to_vllm_mapper = _gemma4_layer_weights_mapper(config)
+        self._full_chain_config_supported = (
+            envs.VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT
+            and current_platform.is_device_capability(90)
+            and _gemma4_full_chain_native_available()
+            and not envs.VLLM_BATCH_INVARIANT
+            and vllm_config.parallel_config.tensor_parallel_size == 8
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and vllm_config.speculative_config is None
+            and vllm_config.lora_config is None
+            and vllm_config.model_config.dtype == torch.bfloat16
+            and config.hidden_size == 5376
+            and config.num_hidden_layers == 60
+            and config.rms_norm_eps == 1e-6
+            and getattr(config, "num_experts", None) is None
+            and not getattr(config, "use_double_wide_mlp", False)
+            and not getattr(config, "num_kv_shared_layers", 0)
+            and not getattr(config, "hidden_size_per_layer_input", 0)
+            and not cache_config.kv_sharing_fast_prefill
+        )
 
         # PLE config values (default to 0 if not present — disables PLE)
         self.hidden_size_per_layer_input = getattr(
@@ -1372,6 +1633,10 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = intermediate_tensors["hidden_states"]
             if per_layer_inputs is not None:
                 per_layer_inputs = intermediate_tensors["per_layer_inputs"]
+        if intermediate_tensors is None and _gemma4_can_run_full_chain(
+            self, hidden_states, per_layer_inputs
+        ):
+            return _gemma4_run_full_chain(self, positions, hidden_states, **kwargs)
         residual = None
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
