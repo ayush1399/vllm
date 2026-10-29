@@ -34,6 +34,29 @@ The FP8 types typically supported in hardware have two distinct representations,
     [`KernelConfig`](../../../cli/serve.md#kernelconfig) in the CLI
     reference and shown by `vllm serve --help=KernelConfig`.
 
+## Experimental Gemma4 producer fusion on Hopper
+
+`VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1` enables an opt-in FP8-input
+producer/consumer path for the FlashInfer/DeepGEMM block-FP8 hybrid on SM90.
+It defaults to disabled. For dense Gemma4 31B with BF16 activations, group128
+FP8 weights and TP8, the full-chain path combines surrounding normalization,
+residual and scalar operations with activation quantization. Other model or
+backend configurations retain their supported fallback paths; BF16 weights
+do not select the FP8 producer.
+
+The Gemma4 chain requires its CUDA implementation in the normal
+`_C_stable_libtorch` extension. Build it using the
+[incremental compilation workflow](../../../contributing/incremental_build.md).
+No separate manually installed shared library is needed. When that optional
+implementation is absent, the whole-chain guard leaves the ordinary model
+loop enabled. Small batches retain the hybrid's raw-scale FlashInfer path;
+larger batches use group128 UE8-rounded scales in the TMA-aligned layout.
+
+This experimental option changes normalization/quantization reduction and
+rounding boundaries. Kernel contract tests do not establish model quality or
+end-to-end serving gains; evaluate the exact checkpoint and workload before
+deployment.
+
 ## Installation
 
 To produce performant FP8 quantized models with vLLM, you'll need to install the [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:

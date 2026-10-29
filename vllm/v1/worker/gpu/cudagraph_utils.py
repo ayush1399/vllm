@@ -266,7 +266,10 @@ class CudaGraphManager:
         max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
-        separate_decode_routine = self.cudagraph_mode.separate_routine()
+        separate_decode_routine = (
+            self.cudagraph_mode.separate_routine()
+            or self.cudagraph_mode == CUDAGraphMode.FULL
+        )
         max_cg_capture_size = self.compilation_config.max_cudagraph_capture_size
 
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
@@ -373,7 +376,10 @@ class CudaGraphManager:
                 descs_by_mode[mixed_mode].append(desc)
 
                 ubatch_desc = self._maybe_ubatch_twin(desc)
-                if ubatch_desc is not None:
+                if (
+                    ubatch_desc is not None
+                    and ubatch_desc not in descs_by_mode[mixed_mode]
+                ):
                     descs_by_mode[mixed_mode].append(ubatch_desc)
 
         for mode, descs in descs_by_mode.items():
@@ -386,15 +392,28 @@ class CudaGraphManager:
                 lora_descs = [
                     d for d in mode_descs if d.num_active_loras == num_active_loras
                 ]
-                current_range_start = 0
-                # Dynamic speculative decoding can produce multiple graphs with the same
-                # num_tokens. Group them so each graph covers the same candidate range.
-                for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
-                    matching = list(group)
-                    for i in range(current_range_start, num_tokens + 1):
-                        key = (i, num_active_loras)
-                        self._candidates.setdefault(key, []).extend(matching)
-                    current_range_start = num_tokens + 1
+                # Decode and mixed FULL graphs have independent padding ladders.
+                # Prefer narrow decode captures, then offer a mixed fallback.
+                for decode_only in (True, False):
+                    routine_descs = [
+                        d
+                        for d in lora_descs
+                        if (
+                            d.uniform_token_count is not None
+                            or d.max_query_len is not None
+                        )
+                        == decode_only
+                    ]
+                    current_range_start = 0
+                    # Different decode widths can share a captured token count.
+                    for num_tokens, group in groupby(
+                        routine_descs, lambda d: d.num_tokens
+                    ):
+                        matching = list(group)
+                        for i in range(current_range_start, num_tokens + 1):
+                            key = (i, num_active_loras)
+                            self._candidates.setdefault(key, []).extend(matching)
+                        current_range_start = num_tokens + 1
 
     @property
     def dp_size(self) -> int:

@@ -111,6 +111,7 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     with (
         patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
         patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
+        patch.object(gpu_cudagraph_utils, "current_stream", MagicMock()),
         patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
         patch.object(
             gpu_cudagraph_utils.torch.cuda,
@@ -317,9 +318,11 @@ def _create_decode_vllm_config(
     dynamic_spec_schedule: list[tuple[int, int, int]] | None = None,
     max_num_seqs: int = 8,
     use_kda_recoverssm: bool = False,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL_AND_PIECEWISE,
+    enable_dbo: bool = False,
 ) -> MagicMock:
     compilation_config = CompilationConfig(
-        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_mode=cudagraph_mode,
         cudagraph_capture_sizes=capture_sizes,
     )
     compilation_config.max_cudagraph_capture_size = capture_sizes[-1]
@@ -330,7 +333,9 @@ def _create_decode_vllm_config(
     vllm_config.scheduler_config = SchedulerConfig.default_factory(
         max_num_seqs=max_num_seqs
     )
-    vllm_config.parallel_config = ParallelConfig()
+    vllm_config.parallel_config = ParallelConfig(
+        enable_dbo=enable_dbo, dbo_decode_token_threshold=2
+    )
     vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=use_kda_recoverssm)
     vllm_config.num_speculative_tokens = num_speculative_tokens
     if dynamic_spec_schedule is None:
@@ -352,6 +357,8 @@ def _make_spec_decode_manager(
     max_num_seqs: int = 8,
     use_kda_recoverssm: bool = False,
     varlen_decode: bool = False,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL_AND_PIECEWISE,
+    enable_dbo: bool = False,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -370,11 +377,14 @@ def _make_spec_decode_manager(
             dynamic_spec_schedule=dynamic_spec_schedule,
             max_num_seqs=max_num_seqs,
             use_kda_recoverssm=use_kda_recoverssm,
+            cudagraph_mode=cudagraph_mode,
+            enable_dbo=enable_dbo,
         ),
         device=torch.device("cpu"),
-        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_mode=cudagraph_mode,
         decode_query_len=decode_query_len,
         varlen_decode=varlen_decode,
+        ubatch_runner=MagicMock() if enable_dbo else None,
     )
     manager._graphs_captured = True
     return manager
@@ -432,6 +442,71 @@ def test_mixed_batch_never_selects_a_uniform_decode_graph(monkeypatch):
     assert desc.num_tokens == 16
 
 
+@pytest.mark.parametrize("decode_query_len", [1, 3, 8])
+@pytest.mark.parametrize("varlen_decode", [False, True])
+def test_full_mode_preserves_decode_specialization(
+    monkeypatch, decode_query_len, varlen_decode
+):
+    """Mixed FULL captures must not replace narrow decode captures."""
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=decode_query_len,
+        varlen_decode=varlen_decode,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    captures = manager._capture_descs[CUDAGraphMode.FULL]
+    decode_captures = {
+        desc
+        for desc in captures
+        if desc.uniform_token_count is not None or desc.max_query_len is not None
+    }
+    mixed_captures = set(captures) - decode_captures
+    assert decode_captures
+    assert mixed_captures
+    assert len(set(captures)) == len(captures)
+
+    for num_reqs in range(1, min(8, 24 // decode_query_len) + 1):
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_reqs * decode_query_len,
+            uniform_token_count=None if varlen_decode else decode_query_len,
+            max_query_len=decode_query_len if varlen_decode else None,
+            num_active_loras=0,
+        )
+        assert desc in decode_captures
+        assert (desc.max_query_len or desc.uniform_token_count) == decode_query_len
+        assert desc.num_reqs is not None
+        assert desc.num_reqs <= 8
+
+    if varlen_decode and decode_query_len > 1:
+        varied = manager.dispatch(
+            num_reqs=3,
+            num_tokens=3 * decode_query_len - 1,
+            uniform_token_count=None,
+            max_query_len=decode_query_len,
+            num_active_loras=0,
+        )
+        assert varied in decode_captures
+
+    mixed = manager.dispatch(
+        num_reqs=1,
+        num_tokens=decode_query_len + 1,
+        uniform_token_count=None,
+        num_active_loras=0,
+    )
+    assert mixed in mixed_captures
+    assert mixed.num_reqs == min(mixed.num_tokens, 8)
+    assert (
+        manager.dispatch(
+            num_reqs=9,
+            num_tokens=9,
+            uniform_token_count=1,
+            num_active_loras=0,
+        ).cg_mode
+        == CUDAGraphMode.NONE
+    )
+
+
 def test_varlen_decode_graph_takes_bounded_decode_batches_only(monkeypatch):
     """A varlen decode graph replays any decode batch within its query-length
     bound. The runner passes no bound for a batch with a prefill, which must not
@@ -454,7 +529,34 @@ def test_varlen_decode_graph_takes_bounded_decode_batches_only(monkeypatch):
     assert dispatch(_DECODE_QUERY_LEN + 1).cg_mode == CUDAGraphMode.PIECEWISE
 
 
-def test_mixed_batch_at_decode_only_token_count_still_gets_a_graph(monkeypatch):
+def test_full_mode_deduplicates_microbatch_captures(monkeypatch):
+    """Uniform and mixed FULL routines can produce the same microbatch twin."""
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=1,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        enable_dbo=True,
+    )
+    captures = manager._capture_descs[CUDAGraphMode.FULL]
+    assert len(captures) == len(set(captures))
+    desc = manager.dispatch(
+        num_reqs=3,
+        num_tokens=3,
+        uniform_token_count=1,
+        num_active_loras=0,
+        num_ubatches=2,
+    )
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.uniform_token_count == 1
+    assert desc.num_ubatches == 2
+
+
+@pytest.mark.parametrize(
+    "cudagraph_mode", [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL]
+)
+def test_mixed_batch_at_decode_only_token_count_still_gets_a_graph(
+    monkeypatch, cudagraph_mode
+):
     """A mixed batch must not fall to eager where only decode graphs are staged.
 
     ``round_up(size, decode_query_len)`` lands FULL decode graphs on token counts
@@ -465,11 +567,19 @@ def test_mixed_batch_at_decode_only_token_count_still_gets_a_graph(monkeypatch):
     instead offers a mixed batch nothing but decode descriptors, whose
     ``uniform_token_count`` it can never match, so it runs fully eager.
     """
-    manager = _make_spec_decode_manager(monkeypatch)
+    manager = _make_spec_decode_manager(monkeypatch, cudagraph_mode=cudagraph_mode)
 
     decode_only_token_counts = sorted(
-        {desc.num_tokens for desc in manager._capture_descs[CUDAGraphMode.FULL]}
-        - {desc.num_tokens for desc in manager._capture_descs[CUDAGraphMode.PIECEWISE]}
+        {
+            desc.num_tokens
+            for desc in manager._capture_descs[CUDAGraphMode.FULL]
+            if desc.uniform_token_count is not None
+        }
+        - {
+            desc.num_tokens
+            for desc in manager._capture_descs[cudagraph_mode.mixed_mode()]
+            if desc.uniform_token_count is None
+        }
     )
     # Guard the premise: with no such token counts this test would cover nothing.
     assert decode_only_token_counts
@@ -481,7 +591,7 @@ def test_mixed_batch_at_decode_only_token_count_still_gets_a_graph(monkeypatch):
             uniform_token_count=None,
             num_active_loras=0,
         )
-        assert desc.cg_mode == CUDAGraphMode.PIECEWISE, num_tokens
+        assert desc.cg_mode == cudagraph_mode.mixed_mode(), num_tokens
         assert desc.uniform_token_count is None, num_tokens
         assert desc.num_tokens >= num_tokens, num_tokens
 
@@ -499,7 +609,12 @@ def test_uniform_decode_beyond_capture_ladder_falls_back(monkeypatch):
     assert desc.cg_mode == CUDAGraphMode.NONE
 
 
-def test_dynamic_spec_decode_shared_token_count_stays_reachable(monkeypatch):
+@pytest.mark.parametrize(
+    "cudagraph_mode", [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL]
+)
+def test_dynamic_spec_decode_shared_token_count_stays_reachable(
+    monkeypatch, cudagraph_mode
+):
     """Every captured decode graph must remain reachable from dispatch().
 
     Under dynamic speculative decoding ``decode_query_lens`` is a list, and the
@@ -518,12 +633,14 @@ def test_dynamic_spec_decode_shared_token_count_stays_reachable(monkeypatch):
         # max_num_seqs is 8, and K narrows as the batch grows, so the schedule
         # covers K 3, 2, 1 and 0, giving decode_query_lens [1, 2, 3, 4].
         dynamic_spec_schedule=[(1, 2, 3), (3, 4, 2), (5, 6, 1), (7, 8, 0)],
+        cudagraph_mode=cudagraph_mode,
     )
 
     full_descs = manager._capture_descs[CUDAGraphMode.FULL]
     by_num_tokens: dict[int, list] = defaultdict(list)
     for desc in full_descs:
-        by_num_tokens[desc.num_tokens].append(desc)
+        if desc.uniform_token_count is not None:
+            by_num_tokens[desc.num_tokens].append(desc)
     # Guard the premise: without collisions this test would not cover the bug.
     assert any(len(descs) > 1 for descs in by_num_tokens.values())
 

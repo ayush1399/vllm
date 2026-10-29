@@ -92,7 +92,8 @@ __global__ void rms_norm_dynamic_per_token_quant_kernel(
 
 // RMS norm + quant kernel
 template <typename scalar_t, typename scalar_out_t, bool has_residual = false,
-          bool is_scale_transposed = false, int32_t group_size = 0>
+          bool is_scale_transposed = false, int32_t group_size = 0,
+          bool scale_ue8m0 = false>
 __global__ void rms_norm_per_block_quant_kernel(
     scalar_out_t* __restrict__ out,  // [..., hidden_size]
     float* __restrict__ scales,      // [num_tokens, hidden_size / group_size]
@@ -112,9 +113,9 @@ __global__ void rms_norm_per_block_quant_kernel(
   // Compute Scale
   // Always able to vectorize due to constraints on hidden_size and group_size
   vllm::vectorized::compute_dynamic_per_token_scales<
-      scalar_t, scalar_out_t, has_residual, is_scale_transposed, group_size>(
-      nullptr, scales, input, weight, rms, scale_ub, hidden_size, input_stride,
-      residual, outer_scale_stride);
+      scalar_t, scalar_out_t, has_residual, is_scale_transposed, group_size,
+      scale_ue8m0>(nullptr, scales, input, weight, rms, scale_ub, hidden_size,
+                   input_stride, residual, outer_scale_stride);
 
   // RMS Norm + Quant
   // Always able to vectorize due to constraints on hidden_size
@@ -127,6 +128,28 @@ __global__ void rms_norm_per_block_quant_kernel(
       has_residual, is_scale_transposed, group_size>(
       out, input, weight, rms, scales, hidden_size, input_stride, residual,
       outer_scale_stride);
+}
+
+template <typename scalar_t, typename scalar_out_t, bool has_residual = false,
+          bool is_scale_transposed = false, int32_t group_size = 128,
+          int32_t VEC_PER_THREAD = 2, int32_t VEC_SIZE = 4,
+          bool scale_ue8m0 = false>
+__global__ void rms_norm_per_block_quant_single_pass_kernel(
+    scalar_out_t* __restrict__ out,       // [..., hidden_size]
+    float* __restrict__ scales,           // [num_tokens, hidden_size /
+                                          // group_size] or
+                                          // [hidden_size / group_size,
+                                          // num_tokens]
+    scalar_t const* __restrict__ input,   // [..., hidden_size]
+    scalar_t const* __restrict__ weight,  // [hidden_size]
+    float const* scale_ub, float const var_epsilon, int32_t const hidden_size,
+    int32_t const input_stride, scalar_t* __restrict__ residual = nullptr,
+    int64_t outer_scale_stride = 1) {
+  vllm::vectorized::rms_norm_per_block_quant_single_pass<
+      scalar_t, scalar_out_t, has_residual, is_scale_transposed, group_size,
+      VEC_PER_THREAD, VEC_SIZE, scale_ue8m0>(
+      out, scales, input, weight, scale_ub, var_epsilon, hidden_size,
+      input_stride, residual, outer_scale_stride);
 }
 
 }  // namespace vllm
@@ -206,6 +229,7 @@ void rms_norm_dynamic_per_token_quant(
 }
 
 // Residual add + RMS norm + dynamic per token
+template <bool scale_ue8m0>
 void rms_norm_per_block_quant_dispatch(
     torch::stable::Tensor& out,           // [..., hidden_size]
     torch::stable::Tensor const& input,   // [..., hidden_size]
@@ -233,9 +257,7 @@ void rms_norm_per_block_quant_dispatch(
 
   dim3 grid(num_tokens);
   const bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
-  const int max_block_size =
-      batch_invariant_launch ? 512 : ((num_tokens <= 256) ? 512 : 256);
-  dim3 block(std::min(hidden_size, max_block_size));
+  const int warp_size = WARP_SIZE;
   const torch::stable::accelerator::DeviceGuard device_guard(
       input.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
@@ -250,21 +272,122 @@ void rms_norm_per_block_quant_dispatch(
                   VLLM_STABLE_DISPATCH_QUANT_TYPES(
                       out.scalar_type(), "rms_norm_per_block_quant_kernel",
                       [&] {
-                        vllm::rms_norm_per_block_quant_kernel<
-                            scalar_in_t, scalar_t, has_residual,
-                            transpose_scale, gs><<<grid, block, 0, stream>>>(
-                            out.mutable_data_ptr<scalar_t>(),
-                            scales.mutable_data_ptr<float>(),
-                            input.const_data_ptr<scalar_in_t>(),
-                            weight.const_data_ptr<scalar_in_t>(),
-                            scale_ub.has_value()
-                                ? scale_ub->const_data_ptr<float>()
-                                : nullptr,
-                            var_epsilon, hidden_size, input_stride,
-                            has_residual
-                                ? residual->mutable_data_ptr<scalar_in_t>()
-                                : nullptr,
-                            scales.stride(1));
+                        if (hidden_size <= 4096 &&
+                            (has_residual || batch_invariant_launch ||
+                             num_tokens <= 256)) {
+                          const int req_threads = hidden_size / 8;
+                          const int block_size = std::max(
+                              warp_size,
+                              ((req_threads + warp_size - 1) / warp_size) *
+                                  warp_size);
+                          if constexpr (sizeof(scalar_in_t) == 2) {
+                            if (input_stride % 8 == 0) {
+                              vllm::rms_norm_per_block_quant_single_pass_kernel<
+                                  scalar_in_t, scalar_t, has_residual,
+                                  transpose_scale, gs, 1, 8, scale_ue8m0>
+                                  <<<grid, dim3(block_size), 0, stream>>>(
+                                      out.mutable_data_ptr<scalar_t>(),
+                                      scales.mutable_data_ptr<float>(),
+                                      input.const_data_ptr<scalar_in_t>(),
+                                      weight.const_data_ptr<scalar_in_t>(),
+                                      scale_ub.has_value()
+                                          ? scale_ub->const_data_ptr<float>()
+                                          : nullptr,
+                                      var_epsilon, hidden_size, input_stride,
+                                      has_residual ? residual->mutable_data_ptr<
+                                                         scalar_in_t>()
+                                                   : nullptr,
+                                      scales.stride(1));
+                              return;
+                            }
+                          }
+                          vllm::rms_norm_per_block_quant_single_pass_kernel<
+                              scalar_in_t, scalar_t, has_residual,
+                              transpose_scale, gs, 2, 4, scale_ue8m0>
+                              <<<grid, dim3(block_size), 0, stream>>>(
+                                  out.mutable_data_ptr<scalar_t>(),
+                                  scales.mutable_data_ptr<float>(),
+                                  input.const_data_ptr<scalar_in_t>(),
+                                  weight.const_data_ptr<scalar_in_t>(),
+                                  scale_ub.has_value()
+                                      ? scale_ub->const_data_ptr<float>()
+                                      : nullptr,
+                                  var_epsilon, hidden_size, input_stride,
+                                  has_residual
+                                      ? residual
+                                            ->mutable_data_ptr<scalar_in_t>()
+                                      : nullptr,
+                                  scales.stride(1));
+                        } else if (hidden_size <= 8192) {
+                          const int req_threads = hidden_size / 16;
+                          const int block_size = std::max(
+                              warp_size,
+                              ((req_threads + warp_size - 1) / warp_size) *
+                                  warp_size);
+                          if constexpr (sizeof(scalar_in_t) == 2) {
+                            if (input_stride % 8 == 0) {
+                              vllm::rms_norm_per_block_quant_single_pass_kernel<
+                                  scalar_in_t, scalar_t, has_residual,
+                                  transpose_scale, gs, 2, 8, scale_ue8m0>
+                                  <<<grid, dim3(block_size), 0, stream>>>(
+                                      out.mutable_data_ptr<scalar_t>(),
+                                      scales.mutable_data_ptr<float>(),
+                                      input.const_data_ptr<scalar_in_t>(),
+                                      weight.const_data_ptr<scalar_in_t>(),
+                                      scale_ub.has_value()
+                                          ? scale_ub->const_data_ptr<float>()
+                                          : nullptr,
+                                      var_epsilon, hidden_size, input_stride,
+                                      has_residual ? residual->mutable_data_ptr<
+                                                         scalar_in_t>()
+                                                   : nullptr,
+                                      scales.stride(1));
+                              return;
+                            }
+                          }
+                          vllm::rms_norm_per_block_quant_single_pass_kernel<
+                              scalar_in_t, scalar_t, has_residual,
+                              transpose_scale, gs, 4, 4, scale_ue8m0>
+                              <<<grid, dim3(block_size), 0, stream>>>(
+                                  out.mutable_data_ptr<scalar_t>(),
+                                  scales.mutable_data_ptr<float>(),
+                                  input.const_data_ptr<scalar_in_t>(),
+                                  weight.const_data_ptr<scalar_in_t>(),
+                                  scale_ub.has_value()
+                                      ? scale_ub->const_data_ptr<float>()
+                                      : nullptr,
+                                  var_epsilon, hidden_size, input_stride,
+                                  has_residual
+                                      ? residual
+                                            ->mutable_data_ptr<scalar_in_t>()
+                                      : nullptr,
+                                  scales.stride(1));
+                        } else {
+                          const int max_block_size =
+                              batch_invariant_launch
+                                  ? 512
+                                  : ((num_tokens <= 256) ? 512 : 256);
+                          dim3 block(std::min(
+                              1024,
+                              std::max<int>(max_block_size, hidden_size / gs)));
+                          vllm::rms_norm_per_block_quant_kernel<
+                              scalar_in_t, scalar_t, has_residual,
+                              transpose_scale, gs, scale_ue8m0>
+                              <<<grid, block, 0, stream>>>(
+                                  out.mutable_data_ptr<scalar_t>(),
+                                  scales.mutable_data_ptr<float>(),
+                                  input.const_data_ptr<scalar_in_t>(),
+                                  weight.const_data_ptr<scalar_in_t>(),
+                                  scale_ub.has_value()
+                                      ? scale_ub->const_data_ptr<float>()
+                                      : nullptr,
+                                  var_epsilon, hidden_size, input_stride,
+                                  has_residual
+                                      ? residual
+                                            ->mutable_data_ptr<scalar_in_t>()
+                                      : nullptr,
+                                  scales.stride(1));
+                        }
                       });
                 });
           });
@@ -272,14 +395,12 @@ void rms_norm_per_block_quant_dispatch(
       });
 }
 
-void rms_norm_per_block_quant(torch::stable::Tensor& out,
-                              torch::stable::Tensor const& input,
-                              torch::stable::Tensor const& weight,
-                              torch::stable::Tensor& scales,
-                              double const var_epsilon,
-                              std::optional<torch::stable::Tensor> scale_ub,
-                              std::optional<torch::stable::Tensor> residual,
-                              int64_t group_size, bool is_scale_transposed) {
+void rms_norm_per_block_quant(
+    torch::stable::Tensor& out, torch::stable::Tensor const& input,
+    torch::stable::Tensor const& weight, torch::stable::Tensor& scales,
+    double const var_epsilon, std::optional<torch::stable::Tensor> scale_ub,
+    std::optional<torch::stable::Tensor> residual, int64_t group_size,
+    bool is_scale_transposed, bool scale_ue8m0) {
   static torch::headeronly::ScalarType kFp8Type =
       is_fp8_ocp() ? torch::headeronly::ScalarType::Float8_e4m3fn
                    : torch::headeronly::ScalarType::Float8_e4m3fnuz;
@@ -297,6 +418,15 @@ void rms_norm_per_block_quant(torch::stable::Tensor& out,
   if (residual) {
     STD_TORCH_CHECK(residual->scalar_type() == input.scalar_type());
     STD_TORCH_CHECK(residual->is_contiguous());
+  }
+
+  if (scale_ue8m0) {
+    STD_TORCH_CHECK(out.scalar_type() == kFp8Type,
+                    "UE8M0 scales require FP8 output");
+    STD_TORCH_CHECK(group_size == 128,
+                    "UE8M0 RMS quant currently requires group size 128");
+    STD_TORCH_CHECK(!scale_ub.has_value(),
+                    "UE8M0 RMS quant does not support scale_ub");
   }
 
   STD_TORCH_CHECK(group_size == 128 || group_size == 64,
@@ -317,7 +447,9 @@ void rms_norm_per_block_quant(torch::stable::Tensor& out,
                   "scales buffer too small: need ", num_tokens * num_groups,
                   " elements, got ", scales.numel());
 
-  rms_norm_per_block_quant_dispatch(out, input, weight, scales, group_size,
-                                    var_epsilon, scale_ub, residual,
-                                    is_scale_transposed);
+  VLLM_STABLE_DISPATCH_BOOL(scale_ue8m0, ue8m0, [&] {
+    rms_norm_per_block_quant_dispatch<ue8m0>(out, input, weight, scales,
+                                             group_size, var_epsilon, scale_ub,
+                                             residual, is_scale_transposed);
+  });
 }

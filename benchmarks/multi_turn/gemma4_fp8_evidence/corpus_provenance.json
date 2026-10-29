@@ -1,0 +1,19 @@
+{
+  "state": "EXACT_LOCAL_DOWNSTREAM_RECIPE_REPRODUCED",
+  "required_external_corpus_sha256": "14d3dcdede5ae8ad126738c170ea18e02ea753037b143c1e31add13ccff16cc4",
+  "local_recipe_exact_bytes": true,
+  "source_rows": 4,
+  "source_sha256": "72792399a274e536c451582f862f3013a4bb2c8689b838e2863a8261a861b35e",
+  "tokenizer_json_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+  "source_metadata_sha256": "7713bfc17a0262c77e24ac3324c1abb9820a535c5a5c519c9be86e8b23612b1c",
+  "recipe_source_sha256": "3be3b35b0114e7ec89ce45feb1026fba2b024151078682598f0fc5df8e8a08ef",
+  "purpose": "Synthetic long-context code/doc natural-EOS control; not production traffic or quality benchmark.",
+  "construction": "Distinct local repository excerpts, deterministic token truncation, question repeated at end.",
+  "original_prompt_generator_located": false,
+  "public_self_contained_reproduction": false,
+  "raw_prompt_or_token_contents_exported": false,
+  "privacy_scope": "Local repository excerpts may include nonpublic or modified source; synthetic does not establish redistribution suitability. Existing external corpus remains required.",
+  "CPU_tokenizer_only": true,
+  "torch_imported": false,
+  "GPU_or_network": false
+}

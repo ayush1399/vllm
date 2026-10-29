@@ -30,9 +30,10 @@ QUANT_DTYPES = [torch.int8, current_platform.fp8_dtype()]
 VEC_HIDDEN_SIZES = [1024, 1025, 1027, 1029]
 # Avoid combinatorial explosion with full Cartesian product
 NUM_TOKENS_HIDDEN_SIZES = [
-    *[(1, i) for i in [1, 64, 128, *VEC_HIDDEN_SIZES, 5120, 5137]],
-    *[(2048, i) for i in [1, 64, *VEC_HIDDEN_SIZES, 5137]],
-    *[(4096, i) for i in [1, 64, 5137]],
+    *[(1, i) for i in [1, 64, 128, *VEC_HIDDEN_SIZES, 4096, 5120, 5137, 8192]],
+    *[(7, i) for i in [128, 4096, 8192]],
+    *[(2048, i) for i in [1, 64, *VEC_HIDDEN_SIZES, 4096, 5137]],
+    *[(4096, i) for i in [1, 64, 4096, 5137]],
 ]
 
 ADD_RESIDUAL = [False, True]
@@ -48,6 +49,7 @@ EPS = 1e-6
 
 
 def _is_valid_config(
+    num_tokens: int,
     hidden_size: int,
     has_scale_ub: bool,
     quant_dtype: torch.dtype,
@@ -65,7 +67,7 @@ def _is_valid_config(
     if (
         group_size is not None
         and tma_alignment != 0
-        and hidden_size // group_size[1] % tma_alignment == 0
+        and num_tokens % tma_alignment == 0
     ):
         return False
     return not (has_scale_ub and quant_dtype != current_platform.fp8_dtype())
@@ -118,6 +120,7 @@ RMS_NORM_CONFIGS = [
         [(None, 0), *itertools.product(GROUP_SIZES, TMA_ALIGNMENTS)],
     )
     if _is_valid_config(
+        num_tokens,
         hidden_size,
         has_scale_ub,
         quant_dtype,
@@ -424,3 +427,315 @@ def test_rms_norm(
                 True,  # is_scale_transposed
             ),
         )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA UE8 contract")
+@pytest.mark.parametrize("num_tokens", [33, 80, 800, 8320])
+@pytest.mark.parametrize("add_residual", [False, True])
+@pytest.mark.parametrize("tma_alignment", [0, 4])
+@pytest.mark.parametrize(
+    "input_case", ["zero", "tiny", "power2-boundaries", "rounding"]
+)
+@torch.inference_mode()
+def test_rms_group128_ue8_cuda_contract(
+    default_vllm_config, num_tokens, add_residual, tma_alignment, input_case
+):
+    """Check rounded-value scales, real TMA pitch, residual output and guards.
+
+    Structured norm inputs isolate the UE8 quant contract. They do not establish
+    equality of arbitrary RMS reduction trees or model quality.
+    """
+    device = "cuda:0"
+    hidden_size, groups, guard = 5376, 42, 16
+    layer = RMSNorm(hidden_size, EPS).to(device=device, dtype=torch.bfloat16)
+    x = torch.full(
+        (num_tokens, hidden_size),
+        0.0 if input_case == "zero" else 0.25 if add_residual else 1.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    residual = None
+    if add_residual:
+        residual = torch.full_like(x, 0.0 if input_case == "zero" else 0.75)
+    if input_case == "rounding":
+        pattern = torch.tensor([0.5, 1.0, 2.0, 4.0], device=device, dtype=x.dtype)
+        pattern = pattern.repeat(hidden_size // 4)
+        x.copy_(pattern * (0.25 if add_residual else 1.0))
+        if add_residual:
+            assert residual is not None
+            residual.copy_(pattern * 0.75)
+    if input_case == "tiny":
+        weights = torch.full((groups,), 1e-12, device=device, dtype=x.dtype)
+    elif input_case == "power2-boundaries":
+        base = torch.tensor([112.0, 224.0, 448.0], device=device, dtype=x.dtype)
+        down = torch.nextafter(base, torch.zeros_like(base))
+        up = torch.nextafter(base, torch.full_like(base, float("inf")))
+        weights = torch.stack((down, base, up)).flatten().repeat(5)[:groups]
+        weights[1::2].neg_()
+    elif input_case == "rounding":
+        weights = torch.tensor(
+            [0.51171875, -1.0078125, 1.015625], device=device, dtype=x.dtype
+        ).repeat(groups // 3)
+    else:
+        weights = torch.ones(groups, device=device, dtype=x.dtype)
+    layer.weight.copy_(weights.repeat_interleave(128))
+    original_x, original_weight = x.clone(), layer.weight.clone()
+    expected, expected_residual = ref_rms_norm(layer, x, residual)
+    ref_q, ref_s = per_token_group_quant_fp8(
+        expected,
+        128,
+        column_major_scales=True,
+        tma_aligned_scales=bool(tma_alignment),
+        use_ue8m0=True,
+    )
+    # Independent scale reference starts AFTER both native BF16 roundings.
+    amax = expected.float().view(num_tokens, groups, 128).abs().amax(-1)
+    raw = amax.clamp_min(1e-10) / 448.0
+    formula_s = torch.exp2(torch.ceil(torch.log2(raw.abs().clamp_min(1e-10))))
+    assert torch.equal(ref_s, formula_s)
+    pitch = num_tokens if tma_alignment == 0 else (num_tokens + 3) // 4 * 4
+    scale_storage = torch.full(
+        (groups * pitch + 2 * guard,),
+        -12345.0,
+        device=device,
+        dtype=torch.float32,
+    )
+    scales = torch.as_strided(
+        scale_storage,
+        (num_tokens, groups),
+        (1, pitch),
+        guard,
+    )
+    quant_storage = torch.full(
+        (num_tokens * hidden_size + 2 * guard,),
+        37,
+        device=device,
+        dtype=torch.uint8,
+    )
+    out = quant_storage[guard:-guard].view(current_platform.fp8_dtype()).view_as(x)
+    residual_out = residual.clone() if residual is not None else None
+    torch.ops._C.rms_norm_per_block_quant(
+        out,
+        x,
+        layer.weight,
+        scales,
+        EPS,
+        None,
+        residual_out,
+        128,
+        True,
+        True,
+    )
+    assert scales.stride() == (1, pitch)
+    assert torch.equal(scales, ref_s)
+    assert torch.equal(out.view(torch.uint8), ref_q.view(torch.uint8))
+    actual_deq = out.float() * scales.repeat_interleave(128, -1)
+    expected_deq = ref_q.float() * ref_s.repeat_interleave(128, -1)
+    assert torch.equal(actual_deq, expected_deq)
+    assert torch.equal(x, original_x)
+    assert torch.equal(layer.weight, original_weight)
+    if add_residual:
+        assert torch.equal(residual_out, expected_residual)
+    assert (quant_storage[:guard] == 37).all()
+    assert (quant_storage[-guard:] == 37).all()
+    assert (scale_storage[:guard] == -12345.0).all()
+    assert (scale_storage[-guard:] == -12345.0).all()
+    if pitch != num_tokens:
+        physical = scale_storage[guard:-guard].view(groups, pitch)
+        assert (physical[:, num_tokens:] == -12345.0).all()
+    wrapped_q, wrapped_s = ops.rms_norm_per_block_quant(
+        x,
+        layer.weight,
+        EPS,
+        current_platform.fp8_dtype(),
+        [1, 128],
+        residual=residual.clone() if residual is not None else None,
+        is_scale_transposed=True,
+        tma_alignment=tma_alignment,
+        scale_ue8m0=True,
+    )
+    assert wrapped_s.stride() == (1, pitch)
+    assert torch.equal(wrapped_s, scales)
+    assert torch.equal(wrapped_q.view(torch.uint8), out.view(torch.uint8))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA UE8 contract")
+@torch.inference_mode()
+def test_rms_group128_ue8_default_preserves_legacy(default_vllm_config):
+    """Omitted schema/wrapper argument and explicit False preserve legacy values."""
+    x = torch.ones((33, 5376), device="cuda:0", dtype=torch.bfloat16)
+    weight = torch.full_like(x[0], 1e-12)
+    legacy_q, legacy_s = ops.rms_norm_per_block_quant(
+        x,
+        weight,
+        EPS,
+        current_platform.fp8_dtype(),
+        [1, 128],
+        is_scale_transposed=True,
+        tma_alignment=4,
+    )
+    false_q, false_s = ops.rms_norm_per_block_quant(
+        x,
+        weight,
+        EPS,
+        current_platform.fp8_dtype(),
+        [1, 128],
+        is_scale_transposed=True,
+        tma_alignment=4,
+        scale_ue8m0=False,
+    )
+    assert torch.equal(legacy_q.view(torch.uint8), false_q.view(torch.uint8))
+    assert torch.equal(legacy_s, false_s)
+    output = torch.empty_like(legacy_q)
+    scales = torch.empty_strided(
+        legacy_s.shape, legacy_s.stride(), device=x.device, dtype=torch.float32
+    )
+    torch.ops._C.rms_norm_per_block_quant(
+        output,
+        x,
+        weight,
+        scales,
+        EPS,
+        None,
+        None,
+        128,
+        True,
+    )
+    assert torch.equal(output.view(torch.uint8), legacy_q.view(torch.uint8))
+    assert torch.equal(scales, legacy_s)
+
+
+# Contract: SM90 H5376 postnorm/add/prenorm with distinct live carry and
+# group128 scales. Exact constant inputs expose mode, scalar and layout errors;
+# direct native calls also exercise host guards before any vectorized launch.
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 chain is SM90-only"
+)
+@pytest.mark.parametrize("num_tokens", [31, 32, 33, 128, 136, 800])
+@pytest.mark.parametrize("mode", [0, 1, 2, 5])
+def test_gemma4_full_chain_native_stream_and_outputs(num_tokens, mode):
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        x = torch.zeros((num_tokens, 5376), device="cuda", dtype=torch.bfloat16)
+        residual = torch.full_like(
+            x, 2, dtype=torch.bfloat16 if mode == 0 else torch.float32
+        )
+        weight = torch.ones(5376, device="cuda", dtype=torch.bfloat16)
+        scalar = torch.tensor([0.5], device="cuda", dtype=torch.bfloat16)
+        carry = torch.empty(
+            (0,) if mode == 5 else x.shape, device="cuda", dtype=torch.float32
+        )
+        output = torch.empty_like(
+            x, dtype=torch.bfloat16 if mode == 5 else torch.float8_e4m3fn
+        )
+        pitch = (num_tokens + 3) // 4 * 4
+        scales = torch.full((42, pitch), -17, device="cuda", dtype=torch.float32)
+        torch.ops._C.gemma4_full_chain_out(
+            x, residual, weight, weight, scalar, carry, output, scales, mode, EPS
+        )
+    stream.synchronize()
+    if mode == 5:
+        assert carry.shape == (0,)
+        assert torch.equal(output, torch.ones_like(x))
+        assert torch.all(scales == -17)
+    else:
+        assert torch.all(carry == (1 if mode == 2 else 2))
+        assert torch.all(output.float() == 256)
+        assert torch.all(scales[:, :num_tokens] == 1 / 256)
+        assert torch.all(scales[:, num_tokens:] == -17)
+    assert torch.count_nonzero(x) == 0
+    assert torch.all(residual == 2)
+    assert torch.all(weight == 1)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 chain is SM90-only"
+)
+@pytest.mark.parametrize("num_tokens", [31, 32])
+@pytest.mark.parametrize("mode", [0, 1, 2, 5])
+def test_gemma4_full_chain_adapter_raw_boundary_and_fake(num_tokens, mode):
+    from vllm.model_executor.layers.gemma4_full_chain import fake, full_chain
+
+    x = torch.zeros((num_tokens, 5376), device="cuda", dtype=torch.bfloat16)
+    residual = torch.full_like(
+        x, 2, dtype=torch.bfloat16 if mode == 0 else torch.float32
+    )
+    weight = torch.ones(5376, device="cuda", dtype=torch.bfloat16)
+    scalar = torch.tensor([0.5], device="cuda", dtype=torch.bfloat16)
+    args = (x, residual, weight, weight, scalar, mode, EPS)
+    carry, output, scales = full_chain(*args)
+    fake_outputs = fake(*args)
+    for actual, abstract in zip((carry, output, scales), fake_outputs):
+        assert (actual.shape, actual.dtype, actual.stride()) == (
+            abstract.shape,
+            abstract.dtype,
+            abstract.stride(),
+        )
+    assert scales.shape == (num_tokens, 42)
+    assert scales.stride() == (1, (num_tokens + 3) // 4 * 4)
+    if mode == 5:
+        assert carry.shape == (0,)
+        assert torch.equal(output, torch.ones_like(x))
+    else:
+        assert torch.all(carry == (1 if mode == 2 else 2))
+        expected_scale = 1 / 448 if num_tokens < 32 else 1 / 256
+        expected_q = 448 if num_tokens < 32 else 256
+        assert torch.all(scales == expected_scale)
+        assert torch.all(output.float() == expected_q)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 chain is SM90-only"
+)
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "unaligned_input",
+        "unaligned_weight",
+        "unaligned_output",
+        "wrong_residual",
+        "wrong_pitch",
+        "zero_rows",
+        "alias",
+        "mode",
+    ],
+)
+def test_gemma4_full_chain_rejects_unsafe_native_buffers(invalid):
+    m, mode = (0, 0) if invalid == "zero_rows" else (32, 3)
+    x = torch.zeros((m, 5376), device="cuda", dtype=torch.bfloat16)
+    residual = torch.ones_like(x)
+    weight = torch.ones(5376, device="cuda", dtype=torch.bfloat16)
+    scalar = torch.ones(1, device="cuda", dtype=torch.bfloat16)
+    carry = torch.empty(x.shape, device="cuda", dtype=torch.float32)
+    output = torch.empty_like(x)
+    scales = torch.empty((42, (m + 3) // 4 * 4), device="cuda", dtype=torch.float32)
+    if invalid == "unaligned_input":
+        x = torch.empty(x.numel() + 1, device="cuda", dtype=x.dtype)[1:].view(x.shape)
+    elif invalid == "unaligned_weight":
+        weight = torch.empty(5377, device="cuda", dtype=weight.dtype)[1:]
+    elif invalid == "unaligned_output":
+        output = torch.empty(output.numel() + 1, device="cuda", dtype=output.dtype)[
+            1:
+        ].view(output.shape)
+    elif invalid == "wrong_residual":
+        residual = residual.float()
+    elif invalid == "wrong_pitch":
+        scales = torch.empty((42, 33), device="cuda", dtype=torch.float32)
+    elif invalid == "alias":
+        output = x
+    elif invalid == "mode":
+        mode = 7
+    with pytest.raises(RuntimeError):
+        torch.ops._C.gemma4_full_chain_out(
+            x, residual, weight, weight, scalar, carry, output, scales, mode, EPS
+        )
+
+
+def test_gemma4_full_chain_rejects_zero_rows_in_fake():
+    from vllm.model_executor.layers.gemma4_full_chain import fake
+
+    x = torch.empty((0, 5376), dtype=torch.bfloat16)
+    weight = torch.empty(5376, dtype=torch.bfloat16)
+    scalar = torch.empty(1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="positive M"):
+        fake(x, x, weight, weight, scalar, 0, EPS)
