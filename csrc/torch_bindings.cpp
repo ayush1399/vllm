@@ -381,11 +381,18 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor? scale_ub, Tensor!? residual) -> ()");
 
   // Fused Layernorm + Block quant kernels
+  // SM90 implementation is registered by its conditionally compiled source.
+  ops.def(
+      "gemma4_full_chain_out(Tensor input, Tensor residual, Tensor "
+      "post_weight, "
+      "Tensor pre_weight, Tensor scalar, Tensor! carry, Tensor! output, "
+      "Tensor! scales, int mode, float epsilon) -> ()");
+
   ops.def(
       "rms_norm_per_block_quant(Tensor! result, Tensor input, "
       "Tensor weight, Tensor! scale, float epsilon, "
       "Tensor? scale_ub, Tensor!? residual, int group_size, "
-      "bool is_scale_transposed) -> ()");
+      "bool is_scale_transposed, bool scale_ue8m0=False) -> ()");
 
   // Fused SiLU+Mul + per-block quantization
   ops.def(

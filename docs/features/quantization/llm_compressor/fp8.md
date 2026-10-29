@@ -34,6 +34,23 @@ The FP8 types typically supported in hardware have two distinct representations,
     [`KernelConfig`](../../../cli/serve.md#kernelconfig) in the CLI
     reference and shown by `vllm serve --help=KernelConfig`.
 
+## Fused FP8 activation quantization on Hopper (experimental)
+
+On SM90, setting `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1` lets the
+FlashInfer/DeepGEMM block-FP8 GEMM consume activations that the preceding
+RMSNorm already quantized to group128 FP8, instead of quantizing BF16 input
+itself. It is disabled by default.
+
+Gemma4 dense models use this to fuse the input and pre-feedforward norms with
+quantization. For Gemma4 31B (hidden size 5376) at TP8, the residual add,
+surrounding norms and layer scalar are additionally fused into one kernel per
+layer boundary. That kernel is built into `_C_stable_libtorch` for SM90 only;
+when it is unavailable the regular model loop is used.
+
+The fused path changes where normalization and quantization round, so outputs
+can differ slightly from the unfused path. Evaluate accuracy on your checkpoint
+before enabling it in production.
+
 ## Installation
 
 To produce performant FP8 quantized models with vLLM, you'll need to install the [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:

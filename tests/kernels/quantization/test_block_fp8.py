@@ -161,6 +161,70 @@ def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
 
 
 @pytest.mark.skipif(
+    not (has_deep_gemm() and has_flashinfer_fp8_blockscale_gemm()),
+    reason="The FlashInfer/DeepGEMM hybrid requires Hopper and both backends.",
+)
+@pytest.mark.parametrize("num_tokens", [32, 33, 83, 513])
+@pytest.mark.parametrize("N,K", [(2048, 5376), (5376, 2688)])
+@pytest.mark.parametrize("row_padding", [0, 16])
+@pytest.mark.parametrize("aligned", [False, True])
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+@torch.inference_mode()
+def test_dynamic_deep_gemm_avoids_scale_copy(
+    monkeypatch, num_tokens, N, K, row_padding, aligned, use_ue8m0
+):
+    """Aligned activation scales remove the layout copy without changing values."""
+    from vllm.envs import disable_envs_cache
+    from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+        _dynamic_flashinfer_deepgemm_blockscale_gemm_impl,
+    )
+
+    disable_envs_cache()
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", str(int(aligned)))
+    torch.manual_seed(42)
+    x = torch.randn(num_tokens, K + row_padding, dtype=torch.bfloat16)[:, :K]
+    weight, weight_scale = per_block_cast_to_fp8(
+        torch.randn(N, K, dtype=torch.bfloat16),
+        (128, 128),
+        use_ue8m0=use_ue8m0,
+    )
+    q, scale = per_token_group_quant_fp8(
+        x, 128, column_major_scales=True, use_ue8m0=use_ue8m0
+    )
+    expected = torch.empty(num_tokens, N, dtype=torch.bfloat16)
+    fp8_gemm_nt(
+        (q, scale),
+        (weight, weight_scale),
+        expected,
+        is_deep_gemm_e8m0_used=use_ue8m0,
+    )
+    for _ in range(2):
+        _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
+            x, weight, weight_scale, 128, use_ue8m0
+        )
+    torch.accelerator.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        actual = _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
+            x, weight, weight_scale, 128, use_ue8m0
+        )
+        torch.accelerator.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if aligned:
+        copies = sum(e.count for e in prof.key_averages() if e.key == "aten::copy_")
+        assert copies == 0
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
+                x, weight, weight_scale, 128, use_ue8m0
+            )
+        x.neg_()
+        graph.replay()
+        torch.testing.assert_close(captured, -expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
     not current_platform.is_cuda(), reason="CUTLASS only supported on CUDA platform."
 )
 @pytest.mark.parametrize(
