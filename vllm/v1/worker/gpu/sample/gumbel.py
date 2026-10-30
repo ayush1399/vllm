@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any
+
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_scalar_specialization_rep,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.batch_shard import shard_owner, shard_row
 
@@ -284,6 +293,58 @@ def gumbel_block_argmax(
     )
 
 
+_SAMPLE_BLOCK_SIZE = 1024
+
+
+def _gumbel_sample_warmup_inputs(*, vllm_config: Any, use_fp64: bool) -> dict[str, Any]:
+    # Covers the target sampler only (non-drafting, no logits cache). Greedy-only
+    # batches skip logits processing, so the kernel also sees model-dtype logits.
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    logits_dtype: Any = WarmupChoices(
+        torch.float32, vllm_config.model_config.head_dtype
+    )
+    logits_stride: Any = WarmupChoices(16, 2)
+    idx_mapping_dtype: Any = WarmupChoices(torch.int64, torch.int32)
+    num_blocks = triton.cdiv(vocab_size, _SAMPLE_BLOCK_SIZE)
+    blocks_stride = triton_scalar_specialization_rep(num_blocks)
+    local_max_dtype = torch.float64 if use_fp64 else torch.float32
+    return triton_warmup_inputs(
+        _gumbel_sample_kernel,
+        grid=(1, num_blocks),
+        local_argmax_ptr=TritonWarmupTensor(
+            torch.int64, shape=(1, num_blocks), strides=(blocks_stride, 1)
+        ),
+        local_argmax_stride=blocks_stride,
+        local_max_ptr=TritonWarmupTensor(
+            local_max_dtype, shape=(1, num_blocks), strides=(blocks_stride, 1)
+        ),
+        local_max_stride=blocks_stride,
+        logits_cache_ptr=None,
+        logits_cache_stride_0=0,
+        logits_cache_stride_1=0,
+        logits_cache_col_ptr=None,
+        logits_cache_source_ptr=None,
+        logits_cache_source_stride=0,
+        logits_ptr=TritonWarmupTensor(
+            logits_dtype, shape=(1, vocab_size), strides=(logits_stride, 1)
+        ),
+        logits_stride=logits_stride,
+        expanded_idx_mapping_ptr=TritonWarmupTensor(idx_mapping_dtype),
+        seeds_ptr=TritonWarmupTensor(torch.int64),
+        pos_ptr=TritonWarmupTensor(torch.int64),
+        temp_ptr=TritonWarmupTensor(torch.float32),
+        vocab_size=triton_scalar_specialization_rep(vocab_size),
+        BLOCK_SIZE=_SAMPLE_BLOCK_SIZE,
+        IS_DRAFTING=False,
+        APPLY_TEMPERATURE=False,
+        USE_FP64=use_fp64,
+        PER_TOKEN_COL=False,
+        CACHE_NUM_SHARDS=1,
+        CACHE_SHARD_IDX=0,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(warmup_inputs=_gumbel_sample_warmup_inputs)
 @triton.jit
 def _gumbel_sample_kernel(
     local_argmax_ptr,
@@ -349,6 +410,11 @@ def _gumbel_sample_kernel(
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
+
+
+def register_gumbel_sample_warmup(*, vllm_config: Any, use_fp64: bool) -> None:
+    # The registry only injects vllm_config for argument-less registrations.
+    _gumbel_sample_kernel.register_warmup(vllm_config=vllm_config, use_fp64=use_fp64)
 
 
 def gumbel_sample(
