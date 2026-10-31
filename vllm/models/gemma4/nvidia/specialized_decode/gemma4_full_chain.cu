@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-#include "../../ops.h"
-#include "../../torch_utils.h"
+#include "ops.h"
+#include "torch_utils.h"
 #include <cstdint>
 #include <limits>
 

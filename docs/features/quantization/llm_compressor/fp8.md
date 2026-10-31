@@ -36,21 +36,29 @@ The FP8 types typically supported in hardware have two distinct representations,
 
 ## Experimental Gemma4 producer fusion on Hopper
 
-`VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1` enables an opt-in FP8-input
+`--additional-config '{"decode_backend":"latency_specialized"}'` enables an opt-in FP8-input
 producer/consumer path for the FlashInfer/DeepGEMM block-FP8 hybrid on SM90.
 It defaults to disabled. For dense Gemma4 31B with BF16 activations, group128
 FP8 weights and TP8, the full-chain path combines surrounding normalization,
-residual and scalar operations with activation quantization. Other model or
-backend configurations retain their supported fallback paths; BF16 weights
-do not select the FP8 producer.
+residual and scalar operations with activation quantization. Per-layer shape
+and quantization guards retain supported fallback paths.
 
-The Gemma4 chain requires its CUDA implementation in the normal
+The default `decode_backend` value is `auto`, which uses the stock model.
+`latency_specialized` selects the NVIDIA implementation under
+`vllm/models/gemma4/nvidia/specialized_decode/`. It requires an SM90 GPU,
+TP8/PP1, the Gemma4 31B block-FP8 target, BF16 activations, FlashInfer blockscale
+GEMMs and `VLLM_USE_DEEP_GEMM_E8M0=1`. Unsupported deployments and unknown backend
+names raise a startup error. This setting replaces the experimental
+`VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT` environment variable.
+
+The Gemma4 CUDA source lives alongside the Python backend in
+`vllm/models/gemma4/nvidia/specialized_decode/gemma4_full_chain.cu` and builds
+into the normal
 `_C_stable_libtorch` extension. Build it using the
 [incremental compilation workflow](../../../contributing/incremental_build.md).
-No separate manually installed shared library is needed. When that optional
-implementation is absent, the whole-chain guard leaves the ordinary model
-loop enabled. Small batches retain the hybrid's raw-scale FlashInfer path;
-larger batches use group128 UE8-rounded scales in the TMA-aligned layout.
+No separate manually installed shared library is needed. The specialized backend
+rejects a build without this implementation at startup. Small batches retain the
+hybrid's raw-scale FlashInfer path; larger batches use group128 UE8-rounded scales in the TMA-aligned layout.
 
 The target full-chain path also supports Gemma4 MTP with a separate assistant
 checkpoint. On the TP8 Gemma4 31B FP8 assistant path, small-row kernels fuse
@@ -63,14 +71,15 @@ Larger pre-projections retain the original sharded execution.
 
 BF16 assistant projections use their ordinary execution. The normalized target
 output and both assistant outputs (draft logits input and backbone feedback)
-retain their existing roles. Auxiliary hidden-state extraction, fast prefill,
-LoRA, MoE and unsupported parallelism configurations retain the ordinary target
-loop. These fusions preserve native raw-scale FP8 tie rounding; FP32 reduction
-order and split-K projection accumulation can still affect numerical results.
+retain their existing roles. Auxiliary hidden-state extraction retains the
+ordinary target loop. Explicit selection rejects fast prefill, LoRA, MoE and
+unsupported parallelism at startup. These fusions preserve native raw-scale
+FP8 tie rounding; FP32 reduction order and split-K projection accumulation can
+still affect numerical results.
 
 For example, add the following to a TP8 Gemma4 31B FP8 server command with
 `VLLM_USE_DEEP_GEMM_E8M0=1` and
-`VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1`:
+`--additional-config '{"decode_backend":"latency_specialized"}'`:
 
 ```bash
 --speculative-config '{"method":"mtp","model":"/path/to/gemma4-assistant","num_speculative_tokens":4}'

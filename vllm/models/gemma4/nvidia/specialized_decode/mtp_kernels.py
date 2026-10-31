@@ -12,6 +12,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynami
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from . import linear as _linear  # noqa: F401
+from . import norm as _norm  # noqa: F401
+
 
 @triton.jit
 def _raw_fp8_quant(values):

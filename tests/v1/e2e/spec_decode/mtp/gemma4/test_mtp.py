@@ -49,13 +49,17 @@ def _target_full_chain_enabled(model):
 
     from vllm.model_executor.models.gemma4 import (
         Gemma4Model,
+    )
+    from vllm.models.gemma4.nvidia.specialized_decode.model import (
         _gemma4_can_run_full_chain,
     )
 
     target = next(m for m in model.modules() if isinstance(m, Gemma4Model))
     x = target.embed_tokens.weight.new_empty((5, 5376))
     assert x.dtype == torch.bfloat16
-    return _gemma4_can_run_full_chain(target, x, None)
+    return getattr(
+        target, "_full_chain_config_supported", False
+    ) and _gemma4_can_run_full_chain(target, x, None)
 
 
 def _has_fp8_assistant(worker):
@@ -88,11 +92,11 @@ def test_fp8_mtp_producer_outputs(
     outputs = []
     profile_dir = tmp_path / "profile"
     for enabled in (True, False):
-        monkeypatch.setenv(
-            "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT", str(int(enabled))
-        )
         with vllm_runner(
             os.environ.get("GEMMA4_FP8_MODEL", "RedHatAI/gemma-4-31B-it-FP8-block"),
+            additional_config={
+                "decode_backend": "latency_specialized" if enabled else "auto"
+            },
             tensor_parallel_size=8,
             profiler_config={
                 "profiler": "torch",
