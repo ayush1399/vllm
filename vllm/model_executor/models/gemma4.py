@@ -1263,7 +1263,10 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             and not envs.VLLM_BATCH_INVARIANT
             and vllm_config.parallel_config.tensor_parallel_size == 8
             and vllm_config.parallel_config.pipeline_parallel_size == 1
-            and vllm_config.speculative_config is None
+            and (
+                vllm_config.speculative_config is None
+                or vllm_config.speculative_config.use_gemma4_mtp()
+            )
             and vllm_config.lora_config is None
             and vllm_config.model_config.dtype == torch.bfloat16
             and config.hidden_size == 5376

@@ -216,3 +216,73 @@ See `gemma4_fp8_evidence/VALIDATION.md` for completed results and retained failu
 Keep C57 cold-tail data
 visible and separate; the tail also occurred on main and is nonblocking by the
 user's direction. Do not infer causality from these historical comparisons.
+
+## Gemma4 FP8 MTP depth matrix
+
+`benchmark_gemma4_mtp.py` runs the real `LLM` entry point with an FP8 target and
+a separate assistant checkpoint, checking each worker's producer eligibility.
+It measures complete `LLM.generate` wall time with prefix caching disabled,
+including prefill, draft calls, verification, sampling and CPU work. These
+measurements are not pure model-forward latency or online serving TPOT.
+
+Run the same command from each source checkout, with identical checkpoints,
+environment, graph policy and an idle TP8 H100 node. Keep output folders distinct:
+
+```bash
+export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1
+export VLLM_USE_DEEP_GEMM_E8M0=1
+export VLLM_DEEP_GEMM_WARMUP=skip
+export OMP_NUM_THREADS=1
+for k in 1 2 3 4; do
+  .venv/bin/python benchmarks/multi_turn/benchmark_gemma4_mtp.py \
+    --model /path/to/gemma4-31B-it-FP8-block \
+    --draft-model /path/to/gemma4-assistant-FP8-block \
+    --k "$k" --output "results/mtp-k${k}.json" \
+    --input-lens 128 2048 20000 --batch-sizes 1 4 \
+    --gsm8k-train /path/to/gsm8k/train.jsonl \
+    --gsm8k-test /path/to/gsm8k/test.jsonl --num-questions 32
+done
+```
+
+The GSM8K options are optional and use the existing five-shot builder and scorer,
+with thinking disabled and greedy sampling. Outputs include per-question
+correctness, truncation counts and token hashes for comparison. A 32-question
+screen is not a replacement for the full quality gate before deployment.
+Compare each candidate k with the same k on the unmodified serving branch;
+changing k changes the amount of verification/draft work and acceptance.
+The original serving branch leaves `target_full_chain` false under MTP. On the
+extension it should be true on all ranks for this supported target. FP8 assistant
+Q/MLP consumer capabilities and norm producer enablement are recorded separately.
+
+To collect bounded kernel traces for the first input length at each batch size,
+add `--profile-dir /path/to/traces`. Profiling generates at most 16 output tokens
+after all timing and quality work, and does not enter the latency samples.
+Start with k=4, C1/C4 and `--output-len 16` to include both the first
+verification-shaped draft and later single-row draft calls.
+
+For isolated fused-kernel measurements with real assistant weights, use:
+
+```bash
+.venv/bin/python benchmarks/kernels/benchmark_gemma4_mtp_fp8.py \
+  --model /path/to/gemma4-assistant-FP8-block \
+  --rows 1 2 3 4 5 8 12 16 20 --ranks 0 7 \
+  --output results/mtp-kernels.json
+```
+
+This benchmark checks native projection outputs before timing, then alternates
+native/fused CUPTI measurements with CUDA graphs and cold L2. It includes
+normalization or concatenation and input quantization; tensor-parallel
+collectives are outside that local boundary. End-to-end MTP generation remains
+the required check for the prepared pre-projection's gather removal.
+
+Completed TP8 H100 measurements, source/checkpoint hashes and validation limits
+are recorded in [MTP_VALIDATION.md](gemma4_fp8_evidence/MTP_VALIDATION.md) and
+`gemma4_fp8_evidence/mtp-metrics.json`.
+
+For speculative acceptance, `benchmark_gemma4_mtp_acceptance.py` reads a fixed
+JSONL chat prompt manifest and records deltas of vLLM's actual accepted-token,
+draft-token, draft-round and per-position counters. Warmup counters are excluded.
+`analyze_gemma4_mtp_acceptance.py` pairs identical prompt groups across source
+arms and computes aggregate acceptance rates, acceptance lengths and bootstrap
+intervals. See [MTP_ACCEPTANCE.md](gemma4_fp8_evidence/MTP_ACCEPTANCE.md) for the
+dataset, execution settings, screening tolerances and reproduction commands.

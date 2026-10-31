@@ -485,3 +485,144 @@ def test_w8a8_block_fp8_b12x_matmul(M, N, K):
     # ordering can flap an output between adjacent BF16 values one ULP apart.
     assert rel_diff < 0.003
     assert cosine >= 0.99999
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 MTP FP8 is SM90-only"
+)
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 8])
+@pytest.mark.parametrize(
+    "n,k,normalize",
+    [
+        (1024, 1024, False),
+        (2048, 1024, False),
+        (1024, 2048, False),
+        (1024, 1024, True),
+        (2048, 1024, True),
+    ],
+)
+@torch.inference_mode()
+def test_gemma4_mtp_fp8_gemv(num_tokens, n, k, normalize):
+    """Fusing tiny assistant producers/GEMVs preserves native FP8 projection values."""
+    from vllm.model_executor.layers.gemma4_mtp_fp8 import fp8_gemv
+
+    torch.manual_seed(0)
+    x = torch.randn((num_tokens, k), device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn((n, k), device="cuda") * 32).to(torch.float8_e4m3fn)
+    scales = torch.ldexp(
+        torch.ones((n // 128, k // 128), device="cuda"),
+        torch.randint(-12, -4, (n // 128, k // 128), device="cuda"),
+    )
+    gamma = torch.randn(k, device="cuda", dtype=torch.bfloat16) if normalize else None
+    normalized = x
+    if gamma is not None:
+        normalized = torch.empty_like(x)
+        torch.ops._C.rms_norm(normalized, x, gamma, 1e-6)
+    expected = flashinfer_fp8_blockscale_gemm(
+        normalized, weight, weight_scale=scales, out_dtype=torch.bfloat16
+    )
+    actual = fp8_gemv(x, weight, scales, gamma, 1e-6)
+    relative_l1 = (actual.float() - expected.float()).abs().sum(dim=-1) / (
+        expected.float().abs().sum(dim=-1).clamp_min(1e-12)
+    )
+    assert torch.isfinite(actual).all()
+    assert relative_l1.max().item() <= 1e-3
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 MTP FP8 is SM90-only"
+)
+@pytest.mark.parametrize("stress", ["zero", "outlier", "small"])
+@pytest.mark.parametrize("normalize", [False, True])
+@torch.inference_mode()
+def test_gemma4_mtp_fp8_gemv_quantization_boundaries(stress, normalize):
+    """Zero groups and disparate magnitudes retain the native raw-scale contract."""
+    from vllm.model_executor.layers.gemma4_mtp_fp8 import fp8_gemv
+
+    torch.manual_seed(123)
+    x = torch.randn((5, 1024), device="cuda", dtype=torch.bfloat16)
+    if stress == "zero":
+        x.zero_()
+    elif stress == "small":
+        x.mul_(1e-8)
+    else:
+        x.mul_(1e-4)
+        x[:, 0] = 1024
+    weight = (torch.randn((1024, 1024), device="cuda") * 32).to(torch.float8_e4m3fn)
+    scales = torch.full((8, 8), 1 / 1024, device="cuda")
+    gamma = torch.ones(1024, device="cuda", dtype=torch.bfloat16) if normalize else None
+    normalized = x
+    if gamma is not None:
+        normalized = torch.empty_like(x)
+        torch.ops._C.rms_norm(normalized, x, gamma, 1e-6)
+    expected = flashinfer_fp8_blockscale_gemm(
+        normalized, weight, weight_scale=scales, out_dtype=torch.bfloat16
+    )
+    actual = fp8_gemv(x, weight, scales, gamma, 1e-6)
+    error = (actual.float() - expected.float()).abs().sum(dim=-1)
+    assert torch.isfinite(actual).all()
+    assert torch.all(error <= expected.float().abs().sum(dim=-1) * 1e-3)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 MTP FP8 is SM90-only"
+)
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 8, 12, 16, 20])
+@torch.inference_mode()
+def test_gemma4_mtp_concat_fp8_projection(num_tokens):
+    """Split-K fusion preserves the complete assistant pre-projection output."""
+    from vllm.model_executor.layers.gemma4_mtp_fp8 import concat_fp8_gemm
+
+    torch.manual_seed(42)
+    x = torch.randn((num_tokens, 5376), device="cuda", dtype=torch.bfloat16)
+    z = torch.randn_like(x)
+    weight = (torch.randn((1024, 10752), device="cuda") * 32).to(torch.float8_e4m3fn)
+    scales = torch.ldexp(
+        torch.ones((8, 84), device="cuda"),
+        torch.randint(-12, -4, (8, 84), device="cuda"),
+    )
+    expected = flashinfer_fp8_blockscale_gemm(
+        torch.cat([x, z], dim=-1), weight, weight_scale=scales, out_dtype=torch.bfloat16
+    )
+    actual = concat_fp8_gemm(x, z, weight, scales)
+    error = (actual.float() - expected.float()).abs().sum(dim=-1)
+    assert torch.isfinite(actual).all()
+    assert torch.all(error <= expected.float().abs().sum(dim=-1) * 1e-3)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 MTP FP8 is SM90-only"
+)
+@pytest.mark.parametrize("num_tokens", [9, 20, 32])
+@pytest.mark.parametrize("normalize", [False, True])
+@torch.inference_mode()
+def test_gemma4_mtp_fp8_runtime_fallback(num_tokens, normalize):
+    """Large warmup rows keep native GEMMs while the same op serves tiny drafts."""
+    import vllm.model_executor.models.gemma4  # noqa: F401
+    from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+        _dynamic_flashinfer_deepgemm_blockscale_gemm_impl,
+    )
+    from vllm.model_executor.layers.gemma4_mtp_fp8 import fp8_gemv
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+
+    torch.manual_seed(99)
+    x = torch.randn((num_tokens, 1024), device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn((1024, 1024), device="cuda") * 32).to(torch.float8_e4m3fn)
+    scales = torch.full((8, 8), 1 / 1024, device="cuda")
+    weight, scales = deepgemm_post_process_fp8_weight_block(
+        weight, scales, (128, 128), use_e8m0=True
+    )
+    gamma = torch.ones(1024, device="cuda", dtype=torch.bfloat16) if normalize else None
+    normalized = x
+    if gamma is not None:
+        normalized = torch.empty_like(x)
+        torch.ops._C.rms_norm(normalized, x, gamma, 1e-6)
+    expected = _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
+        normalized, weight, scales, 128, True
+    )
+    actual = fp8_gemv(x, weight, scales, gamma, 1e-6)
+    error = (actual.float() - expected.float()).abs().sum(dim=-1)
+    assert torch.isfinite(actual).all()
+    assert torch.all(error <= expected.float().abs().sum(dim=-1) * 1e-3)

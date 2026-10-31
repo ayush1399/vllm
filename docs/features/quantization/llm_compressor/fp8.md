@@ -52,6 +52,36 @@ implementation is absent, the whole-chain guard leaves the ordinary model
 loop enabled. Small batches retain the hybrid's raw-scale FlashInfer path;
 larger batches use group128 UE8-rounded scales in the TMA-aligned layout.
 
+The target full-chain path also supports Gemma4 MTP with a separate assistant
+checkpoint. On the TP8 Gemma4 31B FP8 assistant path, small-row kernels fuse
+RMSNorm, raw FP8 activation quantization and Q/gate-up GEMVs, or quantization
+and O/down GEMVs. Batches above eight rows retain the existing GEMM path.
+The pre-projection fuses input concatenation, quantization and GEMM for up to
+20 rows. Its processed FP8 weights are replicated once after loading (about
+11 MiB extra per rank) to avoid gathering projected activations every draft step.
+Larger pre-projections retain the original sharded execution.
+
+BF16 assistant projections use their ordinary execution. The normalized target
+output and both assistant outputs (draft logits input and backbone feedback)
+retain their existing roles. Auxiliary hidden-state extraction, fast prefill,
+LoRA, MoE and unsupported parallelism configurations retain the ordinary target
+loop. These fusions preserve native raw-scale FP8 tie rounding; FP32 reduction
+order and split-K projection accumulation can still affect numerical results.
+
+For example, add the following to a TP8 Gemma4 31B FP8 server command with
+`VLLM_USE_DEEP_GEMM_E8M0=1` and
+`VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1`:
+
+```bash
+--speculative-config '{"method":"mtp","model":"/path/to/gemma4-assistant","num_speculative_tokens":4}'
+```
+
+Use `num_speculative_tokens` values 1, 2, 3 or 4 for the validated depth matrix.
+The assistant checkpoint may use BF16 or compatible group128 block-FP8 weights.
+Small verification batches and later single-row draft calls retain the raw-scale
+FlashInfer quantizer; enabling MTP does not change the scale-layout boundary at
+32 rows.
+
 This experimental option changes normalization/quantization reduction and
 rounding boundaries. Kernel contract tests do not establish model quality or
 end-to-end serving gains; evaluate the exact checkpoint and workload before
