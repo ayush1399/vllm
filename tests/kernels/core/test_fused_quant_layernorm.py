@@ -654,7 +654,7 @@ def test_gemma4_full_chain_native_stream_and_outputs(num_tokens, mode):
 @pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 8, 12, 16, 20, 31, 32])
 @pytest.mark.parametrize("mode", [0, 1, 2, 5])
 def test_gemma4_full_chain_adapter_raw_boundary_and_fake(num_tokens, mode):
-    from vllm.model_executor.layers.gemma4_full_chain import fake, full_chain
+    from vllm.models.gemma4.nvidia.specialized_decode.full_chain import fake, full_chain
 
     x = torch.zeros((num_tokens, 5376), device="cuda", dtype=torch.bfloat16)
     residual = torch.full_like(
@@ -732,7 +732,7 @@ def test_gemma4_full_chain_rejects_unsafe_native_buffers(invalid):
 
 
 def test_gemma4_full_chain_rejects_zero_rows_in_fake():
-    from vllm.model_executor.layers.gemma4_full_chain import fake
+    from vllm.models.gemma4.nvidia.specialized_decode.full_chain import fake
 
     x = torch.empty((0, 5376), dtype=torch.bfloat16)
     weight = torch.empty(5376, dtype=torch.bfloat16)

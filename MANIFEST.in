@@ -8,3 +8,5 @@ include tools/build_rust.py
 
 recursive-include cmake *
 recursive-include csrc *
+
+recursive-include vllm/models/gemma4/nvidia/specialized_decode *.cu

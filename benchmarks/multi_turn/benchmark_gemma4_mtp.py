@@ -23,6 +23,8 @@ def inspect_worker(worker):
 
     from vllm.model_executor.models.gemma4 import (
         Gemma4Model,
+    )
+    from vllm.models.gemma4.nvidia.specialized_decode.model import (
         _gemma4_can_run_full_chain,
     )
 
@@ -87,6 +89,9 @@ def main():
     parser.add_argument("--gsm8k-test", type=Path)
     parser.add_argument("--num-questions", type=int, default=32)
     parser.add_argument("--quality-max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--decode-backend", choices=["auto", "latency_specialized"], default="auto"
+    )
     args = parser.parse_args()
     if (args.gsm8k_train is None) != (args.gsm8k_test is None):
         parser.error("Pass both --gsm8k-train and --gsm8k-test")
@@ -94,6 +99,7 @@ def main():
         parser.error("--repeat must be positive and --warmup nonnegative")
     llm = LLM(
         model=args.model,
+        additional_config={"decode_backend": args.decode_backend},
         profiler_config=(
             {
                 "profiler": "torch",
@@ -134,8 +140,14 @@ def main():
     source_paths = [
         "model_executor/models/gemma4.py",
         "model_executor/models/gemma4_mtp.py",
-        "model_executor/layers/gemma4_full_chain.py",
-        "model_executor/layers/gemma4_mtp_fp8.py",
+        "models/gemma4/nvidia/specialized_decode/config.py",
+        "models/gemma4/nvidia/specialized_decode/linear.py",
+        "models/gemma4/nvidia/specialized_decode/model.py",
+        "models/gemma4/nvidia/specialized_decode/mtp.py",
+        "models/gemma4/nvidia/specialized_decode/norm.py",
+        "models/gemma4/nvidia/specialized_decode/full_chain.py",
+        "models/gemma4/nvidia/specialized_decode/mtp_kernels.py",
+        "model_executor/kernels/linear/__init__.py",
         "model_executor/kernels/linear/scaled_mm/flashinfer.py",
         "_C_stable_libtorch.abi3.so",
     ]
@@ -157,7 +169,6 @@ def main():
             for k, v in os.environ.items()
             if k
             in {
-                "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT",
                 "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER",
                 "VLLM_USE_DEEP_GEMM_E8M0",
                 "VLLM_DEEP_GEMM_WARMUP",

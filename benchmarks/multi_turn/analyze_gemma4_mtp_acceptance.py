@@ -122,13 +122,16 @@ def main():
         for field in ("environment", "prompt_manifest_sha256", "benchmark_sha256"):
             assert b[field] == c[field], (k, field)
         for field in b["args"]:
-            if field != "output":
+            if field not in ("output", "decode_backend"):
                 assert b["args"][field] == c["args"][field], (k, field)
         for field in (
             "_C_stable_libtorch.abi3.so",
             "model_executor/layers/gemma4_full_chain.py",
         ):
-            assert b["source_sha256"][field] == c["source_sha256"][field]
+            source_field = field
+            if field not in b["source_sha256"]:
+                source_field = "models/gemma4/nvidia/specialized_decode/full_chain.py"
+            assert b["source_sha256"][source_field] == c["source_sha256"][source_field]
         for bc, cc in zip(b["cases"], c["cases"]):
             assert (bc["dataset"], bc["batch_size"]) == (
                 cc["dataset"],

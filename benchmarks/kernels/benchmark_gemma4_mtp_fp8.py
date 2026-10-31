@@ -17,9 +17,12 @@ from safetensors import safe_open
 import vllm._custom_ops  # noqa: F401
 import vllm.model_executor.kernels.linear.scaled_mm.flashinfer  # noqa: F401
 import vllm.model_executor.models.gemma4  # noqa: F401
-from vllm.model_executor.layers.gemma4_mtp_fp8 import concat_fp8_gemm, fp8_gemv
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     deepgemm_post_process_fp8_weight_block,
+)
+from vllm.models.gemma4.nvidia.specialized_decode.mtp_kernels import (
+    concat_fp8_gemm,
+    fp8_gemv,
 )
 
 
@@ -105,7 +108,7 @@ def main():
     warnings.filterwarnings("error", message=".*Falling back.*")
     torch.manual_seed(0)
     source = Path(__import__("vllm").__file__).resolve().parent
-    kernel = source / "model_executor/layers/gemma4_mtp_fp8.py"
+    kernel = source / "models/gemma4/nvidia/specialized_decode/mtp_kernels.py"
     result = {
         "gpu": torch.cuda.get_device_name(),
         "torch": str(torch.__version__),

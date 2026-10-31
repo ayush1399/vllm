@@ -58,7 +58,6 @@ export SERVED_MODEL=/models/google/gemma-4-31b-it
 export VLLM_FLASH_ATTN_VERSION=4
 export VLLM_SERVER_DEV_MODE=1
 export VLLM_USE_DEEP_GEMM_E8M0=1
-export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1
 export VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128
 export VLLM_BATCH_INVARIANT=0
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0
@@ -67,6 +66,7 @@ export OMP_NUM_THREADS=1
 
 .venv/bin/python -m vllm.entrypoints.openai.api_server \
   --model "$MODEL_PATH" --served-model-name "$SERVED_MODEL" \
+  --additional-config '{"decode_backend":"latency_specialized"}' \
   --host 127.0.0.1 --port 30000 \
   --max-model-len 65536 --gpu-memory-utilization 0.85 \
   --dtype bfloat16 --kv-cache-dtype bfloat16 --tensor-parallel-size 8 \
@@ -82,6 +82,10 @@ export OMP_NUM_THREADS=1
   --compilation-config "$(cat benchmarks/multi_turn/gemma4-full32768.json)"
 ```
 
+Historical evidence retains the source identities and experimental environment
+variable used at collection time. These commands use the current additional-config
+interface; they do not constitute new benchmark results.
+
 No private worker extension or timing hook is needed by these clients. The
 server must permit prefix-cache reset and return prompt-token usage details and
 streamed token IDs; `VLLM_SERVER_DEV_MODE=1` was set for the local study's reset
@@ -93,14 +97,14 @@ original native profile's effective default was1024 in this pinned study.
 Main-to-optimized comparisons combine code and configuration changes; B1
 provides the ordinary-BF16 control under the same64/FULL32768 policy.
 
-For an **original-main native baseline**, use that source checkout and unset
-`VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT`. Keep the common
+For an **original-main native baseline**, use that source checkout and omit
+`--additional-config` (the stock `auto` backend). Keep the common
 model/TP8/FA4/BF16KV options, omit the
 max-seqs/long-prefill overrides, and use `gemma4-native512.json`. Those changes
 are part of the historical native baseline profile. For an equally configured
-optimized BF16 reference, keep the current64/FULL32768 profile and change the
-model; actual eligibility must prove ordinary BF16 fallback and zero private
-FP8 calls. A plain launch command alone does not prove either path.
+BF16 reference, keep the current64/FULL32768 profile, change the
+model and omit the specialized backend; actual eligibility must prove ordinary
+BF16 fallback and zero private FP8 calls. A plain launch command alone does not prove either path.
 
 ## Restart order
 
@@ -225,11 +229,13 @@ It measures complete `LLM.generate` wall time with prefix caching disabled,
 including prefill, draft calls, verification, sampling and CPU work. These
 measurements are not pure model-forward latency or online serving TPOT.
 
-Run the same command from each source checkout, with identical checkpoints,
-environment, graph policy and an idle TP8 H100 node. Keep output folders distinct:
+Run the current benchmark with each backend using identical checkpoints,
+environment and graph policy on an idle TP8 H100 node. The command below selects
+the specialized backend; repeat it with `--decode-backend auto` and a distinct
+output folder for the stock control. These are new comparisons: the historical
+MTP evidence uses the serving-branch baseline identified in its validation note.
 
 ```bash
-export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT=1
 export VLLM_USE_DEEP_GEMM_E8M0=1
 export VLLM_DEEP_GEMM_WARMUP=skip
 export OMP_NUM_THREADS=1
@@ -237,6 +243,7 @@ for k in 1 2 3 4; do
   .venv/bin/python benchmarks/multi_turn/benchmark_gemma4_mtp.py \
     --model /path/to/gemma4-31B-it-FP8-block \
     --draft-model /path/to/gemma4-assistant-FP8-block \
+    --decode-backend latency_specialized \
     --k "$k" --output "results/mtp-k${k}.json" \
     --input-lens 128 2048 20000 --batch-sizes 1 4 \
     --gsm8k-train /path/to/gsm8k/train.jsonl \
@@ -248,10 +255,10 @@ The GSM8K options are optional and use the existing five-shot builder and scorer
 with thinking disabled and greedy sampling. Outputs include per-question
 correctness, truncation counts and token hashes for comparison. A 32-question
 screen is not a replacement for the full quality gate before deployment.
-Compare each candidate k with the same k on the unmodified serving branch;
+Compare each candidate k with the same k using `--decode-backend auto`;
 changing k changes the amount of verification/draft work and acceptance.
-The original serving branch leaves `target_full_chain` false under MTP. On the
-extension it should be true on all ranks for this supported target. FP8 assistant
+The `auto` backend leaves `target_full_chain` false. With the specialized
+backend it should be true on all ranks for this supported target. FP8 assistant
 Q/MLP consumer capabilities and norm producer enablement are recorded separately.
 
 To collect bounded kernel traces for the first input length at each batch size,
@@ -285,4 +292,18 @@ draft-token, draft-round and per-position counters. Warmup counters are excluded
 `analyze_gemma4_mtp_acceptance.py` pairs identical prompt groups across source
 arms and computes aggregate acceptance rates, acceptance lengths and bootstrap
 intervals. See [MTP_ACCEPTANCE.md](gemma4_fp8_evidence/MTP_ACCEPTANCE.md) for the
-dataset, execution settings, screening tolerances and reproduction commands.
+dataset, execution settings, screening tolerances and historical commands.
+For the current branch, use the explicit backend selector:
+
+```bash
+.venv/bin/python benchmarks/multi_turn/benchmark_gemma4_mtp_acceptance.py \
+  --model /path/to/gemma4-31B-it-FP8-block \
+  --draft-model /path/to/gemma4-assistant-FP8-block \
+  --prompts /path/to/prompts.jsonl --k 4 \
+  --decode-backend latency_specialized \
+  --output /path/to/results/candidate-k4.json
+```
+
+Repeat with `--decode-backend auto` and a distinct baseline output. The old
+environment switch in the historical evidence applies to its recorded source
+versions; the current scripts select the backend with `--decode-backend`.

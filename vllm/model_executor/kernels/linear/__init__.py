@@ -774,6 +774,17 @@ def init_fp8_linear_kernel(
             quantization="fp8_block_w8a8",
             force_kernel=force_kernel,
         )
+        if kernel_type is FlashInferFp8DeepGEMMDynamicBlockScaledKernel:
+            from vllm.models.gemma4.nvidia.specialized_decode.config import (
+                specialized_decode_enabled,
+            )
+
+            if specialized_decode_enabled():
+                from vllm.models.gemma4.nvidia.specialized_decode.linear import (
+                    SpecializedFp8BlockScaledKernel,
+                )
+
+                kernel_type = SpecializedFp8BlockScaledKernel
         if module_name:
             logger.info_once(
                 "Selected %s for %s",

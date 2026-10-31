@@ -504,7 +504,7 @@ def test_w8a8_block_fp8_b12x_matmul(M, N, K):
 @torch.inference_mode()
 def test_gemma4_mtp_fp8_gemv(num_tokens, n, k, normalize):
     """Fusing tiny assistant producers/GEMVs preserves native FP8 projection values."""
-    from vllm.model_executor.layers.gemma4_mtp_fp8 import fp8_gemv
+    from vllm.models.gemma4.nvidia.specialized_decode.mtp_kernels import fp8_gemv
 
     torch.manual_seed(0)
     x = torch.randn((num_tokens, k), device="cuda", dtype=torch.bfloat16)
@@ -537,7 +537,7 @@ def test_gemma4_mtp_fp8_gemv(num_tokens, n, k, normalize):
 @torch.inference_mode()
 def test_gemma4_mtp_fp8_gemv_quantization_boundaries(stress, normalize):
     """Zero groups and disparate magnitudes retain the native raw-scale contract."""
-    from vllm.model_executor.layers.gemma4_mtp_fp8 import fp8_gemv
+    from vllm.models.gemma4.nvidia.specialized_decode.mtp_kernels import fp8_gemv
 
     torch.manual_seed(123)
     x = torch.randn((5, 1024), device="cuda", dtype=torch.bfloat16)
@@ -571,7 +571,7 @@ def test_gemma4_mtp_fp8_gemv_quantization_boundaries(stress, normalize):
 @torch.inference_mode()
 def test_gemma4_mtp_concat_fp8_projection(num_tokens):
     """Split-K fusion preserves the complete assistant pre-projection output."""
-    from vllm.model_executor.layers.gemma4_mtp_fp8 import concat_fp8_gemm
+    from vllm.models.gemma4.nvidia.specialized_decode.mtp_kernels import concat_fp8_gemm
 
     torch.manual_seed(42)
     x = torch.randn((num_tokens, 5376), device="cuda", dtype=torch.bfloat16)
@@ -602,10 +602,10 @@ def test_gemma4_mtp_fp8_runtime_fallback(num_tokens, normalize):
     from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
         _dynamic_flashinfer_deepgemm_blockscale_gemm_impl,
     )
-    from vllm.model_executor.layers.gemma4_mtp_fp8 import fp8_gemv
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         deepgemm_post_process_fp8_weight_block,
     )
+    from vllm.models.gemma4.nvidia.specialized_decode.mtp_kernels import fp8_gemv
 
     torch.manual_seed(99)
     x = torch.randn((num_tokens, 1024), device="cuda", dtype=torch.bfloat16)

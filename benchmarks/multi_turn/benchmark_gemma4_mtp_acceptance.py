@@ -81,11 +81,15 @@ def main():
     parser.add_argument("--k", type=int, choices=[1, 2, 3, 4], required=True)
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 4])
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--decode-backend", choices=["auto", "latency_specialized"], default="auto"
+    )
     args = parser.parse_args()
     records = [json.loads(s) for s in args.prompts.read_text().splitlines()]
     datasets = sorted({r["dataset"] for r in records})
     llm = LLM(
         model=args.model,
+        additional_config={"decode_backend": args.decode_backend},
         worker_extension_cls=(
             "benchmarks.multi_turn.benchmark_gemma4_mtp.WorkerExtension"
         ),
@@ -116,8 +120,14 @@ def main():
     paths = [
         "model_executor/models/gemma4.py",
         "model_executor/models/gemma4_mtp.py",
-        "model_executor/layers/gemma4_full_chain.py",
-        "model_executor/layers/gemma4_mtp_fp8.py",
+        "models/gemma4/nvidia/specialized_decode/config.py",
+        "models/gemma4/nvidia/specialized_decode/linear.py",
+        "models/gemma4/nvidia/specialized_decode/model.py",
+        "models/gemma4/nvidia/specialized_decode/mtp.py",
+        "models/gemma4/nvidia/specialized_decode/norm.py",
+        "models/gemma4/nvidia/specialized_decode/full_chain.py",
+        "models/gemma4/nvidia/specialized_decode/mtp_kernels.py",
+        "model_executor/kernels/linear/__init__.py",
         "model_executor/kernels/linear/scaled_mm/flashinfer.py",
         "_C_stable_libtorch.abi3.so",
     ]
@@ -138,7 +148,6 @@ def main():
         "environment": {
             k: os.environ.get(k)
             for k in (
-                "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT",
                 "VLLM_USE_DEEP_GEMM_E8M0",
                 "VLLM_DEEP_GEMM_WARMUP",
                 "VLLM_BATCH_INVARIANT",
