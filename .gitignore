@@ -232,6 +232,8 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+!benchmarks/multi_turn/gemma4_fp8_evidence/mtp-metrics.json
+!benchmarks/multi_turn/gemma4_fp8_evidence/mtp-acceptance.json
 
 # Linting
 actionlint

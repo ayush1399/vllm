@@ -108,8 +108,10 @@ class FlashInferFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         if act_quant_desc.group_shape != GroupShape(1, 128):
             return (
                 False,
-                "Supports only dynamic per token group activation "
-                "quantization with group_shape=(1,128).",
+                (
+                    "Supports only dynamic per token group activation "
+                    "quantization with group_shape=(1,128)."
+                ),
             )
 
         if not should_use_flashinfer_for_blockscale_fp8_gemm(
@@ -208,6 +210,14 @@ class FlashInferFp8DeepGEMMDynamicBlockScaledKernel(
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        if getattr(layer, "_gemma4_mtp_fp8_gemv", False) and isinstance(
+            x, torch.Tensor
+        ):
+            from vllm.model_executor.layers.gemma4_mtp_fp8 import maybe_mtp_fp8_gemv
+
+            output = maybe_mtp_fp8_gemv(layer, x)
+            if output is not None:
+                return output if bias is None else output + bias
         qa = as_quantized_activation(x, self.input_quant_key())
         if qa is None:
             assert isinstance(x, torch.Tensor)

@@ -596,6 +596,7 @@ steps:
   - tools/check_wheel_deepgemm.py
   - vllm/utils/deep_gemm.py
   - vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py
+  - vllm/model_executor/layers/gemma4_mtp_fp8.py
   - vllm/model_executor/layers/fused_moe
   - vllm/model_executor/layers/quantization
   - tests/kernels/quantization/test_block_fp8.py

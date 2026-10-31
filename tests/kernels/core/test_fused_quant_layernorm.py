@@ -651,7 +651,7 @@ def test_gemma4_full_chain_native_stream_and_outputs(num_tokens, mode):
 @pytest.mark.skipif(
     not current_platform.is_device_capability(90), reason="Gemma4 chain is SM90-only"
 )
-@pytest.mark.parametrize("num_tokens", [31, 32])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 8, 12, 16, 20, 31, 32])
 @pytest.mark.parametrize("mode", [0, 1, 2, 5])
 def test_gemma4_full_chain_adapter_raw_boundary_and_fake(num_tokens, mode):
     from vllm.model_executor.layers.gemma4_full_chain import fake, full_chain

@@ -626,3 +626,22 @@ steps:
       - tests/utils.py
       - tests/v1/e2e/spec_decode/
       - vllm/platforms/rocm.py
+
+- label: ":nvidia: (8xH100) Gemma4 FP8 MTP producers"
+  key: spec-decode-gemma4-fp8-producers
+  device: h100
+  num_devices: 8
+  timeout_in_minutes: 60
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+    - vllm/model_executor/models/gemma4.py
+    - vllm/model_executor/models/gemma4_mtp.py
+    - vllm/model_executor/layers/gemma4_full_chain.py
+    - vllm/model_executor/layers/gemma4_mtp_fp8.py
+    - vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py
+    - csrc/quantization/fused_kernels/
+    - tests/v1/e2e/spec_decode/mtp/gemma4/test_mtp.py
+  commands:
+    - >-
+      pytest -v -s
+      v1/e2e/spec_decode/mtp/gemma4/test_mtp.py::test_fp8_mtp_producer_outputs
