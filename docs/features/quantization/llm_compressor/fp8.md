@@ -52,7 +52,7 @@ names raise a startup error. This setting replaces the experimental
 `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER_FP8_INPUT` environment variable.
 
 The Gemma4 CUDA source lives alongside the Python backend in
-`vllm/models/gemma4/nvidia/specialized_decode/gemma4_full_chain.cu` and builds
+`vllm/models/gemma4/nvidia/specialized_decode/` and builds
 into the normal
 `_C_stable_libtorch` extension. Build it using the
 [incremental compilation workflow](../../../contributing/incremental_build.md).
@@ -87,14 +87,71 @@ For example, add the following to a TP8 Gemma4 31B FP8 server command with
 
 Use `num_speculative_tokens` values 1, 2, 3 or 4 for the validated depth matrix.
 The assistant checkpoint may use BF16 or compatible group128 block-FP8 weights.
-Small verification batches and later single-row draft calls retain the raw-scale
-FlashInfer quantizer; enabling MTP does not change the scale-layout boundary at
-32 rows.
+Verification batches below 32 rows fuse raw-scale FP8 quantization into the
+full-chain normalization producer and into target GELU/gating. Larger target
+GELU/gating batches also produce FP8 directly, using UE8-rounded scales.
+These producers
+preserve the FlashInfer CUTLASS quantizer's approximate reciprocal. Activation
+rounding follows the selected execution path: native CUDA GELU retains its
+intermediate BF16 rounding, while fused Inductor GELU/gating rounds after the
+multiply. Inductor's `emulate_precision_casts` setting retains intermediate casts. The scale-layout boundary remains at 32 rows.
+
+A CUDA C++ kernel also combines per-head Q/K/V
+normalization and NeoX RoPE. It supports both the 256-dimensional sliding heads
+and the 512-dimensional global heads, including Gemma4's identity-padded
+proportional RoPE. Assistant layers use the Q-only variant. On supported target
+FlashAttention layers, the same kernel writes K/V directly into the paged BF16
+cache. It supports the backend's packed cache layout and skips padded slots.
+Unsupported cache formats and distributed-context attention retain the existing
+preparation and insertion path.
+
+The inter-layer residual carry uses BF16 storage after its existing BF16
+rounding point. Normalization statistics and the post-attention residual still
+use FP32. This reduces carry traffic without changing its storage precision
+relative to that rounding point.
+
+The full-chain path also connects normalization to gate/up and local QKV GEMMs
+using programmatic dependent launch (PDL). The GEMM stages independent weights
+before waiting for normalization, then reads the local FP8 activation. This
+applies below 32 rows to supported 5376-input projections; larger batches retain
+the existing GEMMs. No additional TP communication or residual replication is
+required. The optional C++ kernels compile once during weight loading using
+the installed CUDA toolkit, Ninja, and FlashInfer's CUTLASS/DeepGEMM headers.
+They are cached under `VLLM_CACHE_ROOT`; unavailable builds retain the existing
+path. Disable only this optimization with
+`--additional-config '{"decode_backend":"latency_specialized","gemma4_pdl":false}'`.
+
+Local QKV projections with up to eight rows use six K partitions. QKV
+preparation consumes the FP32 partials directly, so the path does not launch a
+separate partition-reduction kernel or materialize the full BF16 QKV tensor.
+Larger projections retain the existing geometry.
+
+For supported short-query target FA4 calls, the SM90 dependency patch selects
+active splits from each request's sequence length and sliding window. The
+captured maximum grid remains fixed; inactive splits skip attention work.
+A CUDA C++ combine kernel produces FP8 activations and block scales directly
+for the output projection. This removes the intermediate BF16 attention output
+and a separate quantization pass. Build the patched `vllm-flash-attn` dependency
+alongside the native extension; the CMake build applies the patches.
 
 This experimental option changes normalization/quantization reduction and
 rounding boundaries. Kernel contract tests do not establish model quality or
 end-to-end serving gains; evaluate the exact checkpoint and workload before
 deployment.
+
+`benchmarks/multi_turn/benchmark_gemma4_mtp.py` queues each complete batch with
+scheduling paused, then records resume-to-completion wall time,
+per-request prefill/decode intervals and speculative acceptance counts.
+Performance runs use a fixed acceptance schedule (`--accepted-draft-tokens`,
+defaulting to all draft tokens). Run GSM8K separately with `--quality-only`,
+which uses actual drafting and standard rejection sampling. The
+`--no-gemma4-pdl` flag provides the matched runtime control.
+Its JSON output separates the batch interval before the first output,
+the interval where prefill and decode can overlap, and the decode tail after
+every request has produced a first token. These are engine elapsed times,
+including CPU work. Compare both runs with the same graph policy. The
+`flash_attn_max_num_splits_for_cuda_graph` setting controls the FA3 AOT path;
+it does not force 32 splits in FA4.
 
 ## Installation
 

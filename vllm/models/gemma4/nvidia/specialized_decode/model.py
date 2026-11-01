@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
+    FP8BlockParams,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     get_input_quant_key,
@@ -16,6 +19,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynami
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer
 
 from . import full_chain  # noqa: F401
+from .activation import SpecializedGemma4MLP
+from .attention import SpecializedGemma4Attention, can_prepare_cached, supported
 from .norm import _maybe_gemma4_hybrid_norm_quant
 
 if TYPE_CHECKING:
@@ -23,6 +28,9 @@ if TYPE_CHECKING:
 
 
 class SpecializedGemma4DecoderLayer(Gemma4DecoderLayer):
+    attention_layer_cls = SpecializedGemma4Attention
+    mlp_layer_cls = SpecializedGemma4MLP
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fuse_norm_quant = (
@@ -81,8 +89,6 @@ def _gemma4_can_run_full_chain(
     hidden_states: torch.Tensor,
     per_layer_inputs: torch.Tensor | None,
 ) -> bool:
-    from vllm.model_executor.models.gemma4 import Gemma4Attention, Gemma4MLP
-
     if (
         not model._full_chain_config_supported
         or model.fast_prefill_enabled
@@ -103,8 +109,8 @@ def _gemma4_can_run_full_chain(
     for layer in model.layers:
         if (
             type(layer) is not SpecializedGemma4DecoderLayer
-            or type(layer.self_attn) is not Gemma4Attention
-            or type(layer.mlp) is not Gemma4MLP
+            or type(layer.self_attn) is not SpecializedGemma4Attention
+            or type(layer.mlp) is not SpecializedGemma4MLP
             or not layer._fuse_norm_quant
             or layer.enable_moe_block
             or layer.self_attn.is_kv_shared_layer
@@ -142,6 +148,49 @@ def _gemma4_full_chain_activation(
     )
 
 
+def _norm_projection(x, residual, post, pre, scalar, linear, mode):
+    from . import pdl  # noqa: F401
+
+    params = FP8BlockParams.from_layer(linear)
+    return torch.ops.vllm.gemma4_norm_gemm(
+        x,
+        residual,
+        post.weight,
+        pre.weight,
+        scalar,
+        params.weight,
+        params.block_scale,
+        mode,
+        True,
+    )
+
+
+def _norm_next_qkv(x, residual, layer, next_attention, positions):
+    from vllm import ir
+
+    from .norm import preserve_bf16_intermediates
+
+    params = FP8BlockParams.from_layer(next_attention.self_attn.qkv_proj)
+    return torch.ops.vllm.gemma4_norm_qkv_prep(
+        x,
+        residual,
+        layer.post_feedforward_layernorm.weight,
+        next_attention.input_layernorm.weight,
+        layer.layer_scalar,
+        params.weight,
+        params.block_scale,
+        next_attention.self_attn.q_norm.weight,
+        next_attention.self_attn.k_norm.weight,
+        next_attention.self_attn.rotary_emb.cos_sin_cache,
+        positions,
+        next_attention.self_attn.num_heads,
+        next_attention.self_attn.num_kv_heads,
+        next_attention.self_attn.head_dim,
+        ir.ops.rms_norm.get_priority()[0] == "native" and preserve_bf16_intermediates(),
+        next_attention.self_attn.attn.layer_name,
+    )
+
+
 def _gemma4_run_full_chain(
     model: "Gemma4Model",
     positions: torch.Tensor,
@@ -154,20 +203,39 @@ def _gemma4_run_full_chain(
     )
     assert isinstance(activation, QuantizedActivation)
     carry = hidden_states
+    projected_qkv = None
+    prepared_q = None
     for index, layer in enumerate(model.layers):
         attention_out = layer.self_attn(
-            positions=positions, hidden_states=activation, **kwargs
+            positions=positions,
+            hidden_states=activation,
+            projected_qkv=projected_qkv,
+            prepared_q=prepared_q,
+            **kwargs,
         )
-        residual, data, scale = torch.ops.vllm.gemma4_full_chain(
-            attention_out,
-            carry,
-            layer.post_attention_layernorm.weight,
-            layer.pre_feedforward_layernorm.weight,
-            layer.layer_scalar,
-            0 if index == 0 else 1,
-            1e-6,
-        )
-        feedforward_out = layer.mlp(_gemma4_full_chain_activation(data, scale))
+        if getattr(layer.mlp.gate_up_proj, "_gemma4_pdl", False):
+            residual, gate_up = _norm_projection(
+                attention_out,
+                carry,
+                layer.post_attention_layernorm,
+                layer.pre_feedforward_layernorm,
+                layer.layer_scalar,
+                layer.mlp.gate_up_proj,
+                0 if index == 0 else 1,
+            )
+            feedforward_out = layer.mlp.forward_gate_up(gate_up)
+        else:
+            residual, data, scale = torch.ops.vllm.gemma4_full_chain(
+                attention_out,
+                carry,
+                layer.post_attention_layernorm.weight,
+                layer.pre_feedforward_layernorm.weight,
+                layer.layer_scalar,
+                0 if index == 0 else 1,
+                1e-6,
+                True,
+            )
+            feedforward_out = layer.mlp(_gemma4_full_chain_activation(data, scale))
         if index + 1 == len(model.layers):
             _, normalized, _ = torch.ops.vllm.gemma4_full_chain(
                 feedforward_out,
@@ -177,17 +245,42 @@ def _gemma4_run_full_chain(
                 layer.layer_scalar,
                 5,
                 1e-6,
+                True,
             )
             return normalized
         next_layer = model.layers[index + 1]
-        carry, data, scale = torch.ops.vllm.gemma4_full_chain(
-            feedforward_out,
-            residual,
-            layer.post_feedforward_layernorm.weight,
-            next_layer.input_layernorm.weight,
-            layer.layer_scalar,
-            2,
-            1e-6,
-        )
-        activation = _gemma4_full_chain_activation(data, scale)
+        if getattr(next_layer.self_attn.qkv_proj, "_gemma4_pdl", False) and supported(
+            next_layer.self_attn, positions
+        ):
+            if can_prepare_cached(next_layer.self_attn):
+                carry, prepared_q = _norm_next_qkv(
+                    feedforward_out, residual, layer, next_layer, positions
+                )
+                projected_qkv = None
+            else:
+                carry, projected_qkv = _norm_projection(
+                    feedforward_out,
+                    residual,
+                    layer.post_feedforward_layernorm,
+                    next_layer.input_layernorm,
+                    layer.layer_scalar,
+                    next_layer.self_attn.qkv_proj,
+                    2,
+                )
+                prepared_q = None
+            activation = None
+        else:
+            carry, data, scale = torch.ops.vllm.gemma4_full_chain(
+                feedforward_out,
+                residual,
+                layer.post_feedforward_layernorm.weight,
+                next_layer.input_layernorm.weight,
+                layer.layer_scalar,
+                2,
+                1e-6,
+                True,
+            )
+            projected_qkv = None
+            prepared_q = None
+            activation = _gemma4_full_chain_activation(data, scale)
     raise AssertionError("Full-chain eligibility requires 60 decoder layers")

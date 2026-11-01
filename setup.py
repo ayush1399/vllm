@@ -1631,6 +1631,8 @@ package_data = {
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",
+        "models/gemma4/nvidia/specialized_decode/*.cu",
+        "models/gemma4/nvidia/specialized_decode/*.cuh",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",

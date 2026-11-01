@@ -483,7 +483,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(GEMMA4_FULL_CHAIN_ARCHS AND
        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
       set(GEMMA4_FULL_CHAIN_SRC
-        "vllm/models/gemma4/nvidia/specialized_decode/gemma4_full_chain.cu")
+        "vllm/models/gemma4/nvidia/specialized_decode/gemma4_full_chain.cu"
+        "vllm/models/gemma4/nvidia/specialized_decode/attention_prep.cu")
       list(APPEND VLLM_STABLE_EXT_SRC "${GEMMA4_FULL_CHAIN_SRC}")
       set_gencode_flags_for_srcs(
         SRCS "${GEMMA4_FULL_CHAIN_SRC}"

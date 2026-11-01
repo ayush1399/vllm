@@ -4,8 +4,10 @@
 import gzip
 import json
 import os
+from decimal import Decimal
 
 import pytest
+import regex as re
 
 from tests.utils import multi_gpu_test, single_gpu_only
 from vllm import SamplingParams
@@ -75,6 +77,15 @@ def _has_fp8_assistant(worker):
     )
 
 
+def _target_pdl_enabled(model):
+    from vllm.model_executor.models.gemma4 import Gemma4Model
+
+    target = next(m for m in model.modules() if isinstance(m, Gemma4Model))
+    return all(
+        getattr(layer.mlp.gate_up_proj, "_gemma4_pdl", False) for layer in target.layers
+    )
+
+
 @pytest.mark.skipif(
     not current_platform.is_device_capability(90), reason="SM90 FP8 producers"
 )
@@ -83,7 +94,7 @@ def _has_fp8_assistant(worker):
 def test_fp8_mtp_producer_outputs(
     monkeypatch, vllm_runner, num_speculative_tokens, enable_pickle, tmp_path
 ):
-    """FP8 MTP must select the target chain and preserve short greedy answers."""
+    """Select the fused target path and answer short arithmetic prompts correctly."""
     monkeypatch.setenv("VLLM_USE_DEEP_GEMM_E8M0", "1")
     prompts = [
         "What is 7 times 8? Answer with only the integer.",
@@ -123,21 +134,21 @@ def test_fp8_mtp_producer_outputs(
             },
         ) as runner:
             assert runner.llm.apply_model(_target_full_chain_enabled) == [enabled] * 8
+            assert runner.llm.apply_model(_target_pdl_enabled) == [enabled] * 8
             fp8_draft = runner.llm.collective_rpc(_has_fp8_assistant)
             if enabled:
                 runner.llm.start_profile("mtp-producers")
-            generated = runner.llm.chat(
-                [[{"role": "user", "content": prompt}] for prompt in prompts],
-                SamplingParams(temperature=0, max_tokens=16),
-                chat_template_kwargs={"enable_thinking": False},
-                use_tqdm=False,
-            )
-            outputs.append(
-                [
-                    (output.outputs[0].token_ids, output.outputs[0].text)
-                    for output in generated
-                ]
-            )
+            generated = []
+            for batch in (prompts[:1], prompts):
+                generated.extend(
+                    runner.llm.chat(
+                        [[{"role": "user", "content": prompt}] for prompt in batch],
+                        SamplingParams(temperature=0, max_tokens=16),
+                        chat_template_kwargs={"enable_thinking": False},
+                        use_tqdm=False,
+                    )
+                )
+            outputs.append([output.outputs[0].text for output in generated])
             if enabled:
                 runner.llm.stop_profile()
                 traces = list(profile_dir.glob("*rank0*.pt.trace.json.gz"))
@@ -151,7 +162,17 @@ def test_fp8_mtp_producer_outputs(
                     if event.get("cat") == "kernel"
                 }
                 assert any("chain<" in name for name in names)
+                assert any("gemma4_pdl_gemm_kernel" in name for name in names)
+                assert any("combine_quant" in name for name in names)
+                assert not any(
+                    "reshape_and_cache_flash_kernel" in name for name in names
+                )
                 if all(fp8_draft):
                     assert any("_fp8_gemv_kernel" in name for name in names)
                     assert any("_concat_fp8_gemm_kernel" in name for name in names)
-    assert outputs[0] == outputs[1]
+    for generated in outputs:
+        assert len(generated) == 3
+        for text, expected in zip(generated, (56, 56, 27)):
+            numbers = re.findall(r"-?\d+(?:\.\d+)?", text)
+            assert numbers, text
+            assert Decimal(numbers[-1]) == expected, text

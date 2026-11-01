@@ -260,6 +260,8 @@ class Gemma4MTPAttention(nn.Module):
 
 
 class Gemma4MTPDecoderLayer(nn.Module):
+    attention_layer_cls = Gemma4MTPAttention
+
     def __init__(
         self,
         config,
@@ -275,7 +277,7 @@ class Gemma4MTPDecoderLayer(nn.Module):
         head_dim = layer_config.head_dim
         num_kv_heads = layer_config.num_key_value_heads
 
-        self.self_attn = Gemma4MTPAttention(
+        self.self_attn = self.attention_layer_cls(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

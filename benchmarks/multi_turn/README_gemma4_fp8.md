@@ -225,9 +225,37 @@ user's direction. Do not infer causality from these historical comparisons.
 
 `benchmark_gemma4_mtp.py` runs the real `LLM` entry point with an FP8 target and
 a separate assistant checkpoint, checking each worker's producer eligibility.
-It measures complete `LLM.generate` wall time with prefix caching disabled,
-including prefill, draft calls, verification, sampling and CPU work. These
+It pauses scheduling, enqueues a complete batch, then measures scheduler resume
+through completion with prefix caching disabled, including prefill, draft calls,
+verification, sampling, the resume RPC and CPU work. Pause/enqueue work is outside
+timing. This avoids racing request admission against the first engine step. These
 measurements are not pure model-forward latency or online serving TPOT.
+
+Each case also records `phase_samples` and `phase_median_s`. Request timings
+split the engine interval into scheduling-to-first-token (`prefill_s`) and
+first-to-last-token (`decode_s`), with queue time and frontend TTFT recorded
+separately. These intervals include CPU work. For batches, `initial_prefill_s`
+ends at the earliest first token, `mixed_prefill_decode_s` runs until every
+request has produced its first token, and `decode_tail_s` covers the remaining
+generation. Chunked prefill can overlap earlier requests' decode, so request
+decode times are not pure decode costs and must not be summed across requests.
+Per-request speculative acceptance counts and histograms are saved alongside
+the timings. Stats collection is enabled for both sides of a comparison.
+Performance runs always use deterministic synthetic acceptance. By default all
+draft tokens are accepted; `--accepted-draft-tokens 2` accepts exactly two at
+each verification step. Keep this setting identical between arms. The
+`--no-gemma4-pdl` control disables only the new normalization/GEMM overlap;
+worker metadata records the selected gate/up and QKV paths on every rank.
+The worker metadata also records effective runtime settings, attention backends,
+native-library paths, and any vLLM modules imported from outside the selected
+source tree. For an upstream-main comparison, copy the same benchmark into an
+isolated main checkout and use `--decode-backend auto` there. Build its core
+extension from that checkout, hold provider versions fixed, and verify the
+recorded paths and configuration before comparing results. Repeated custom-op
+enable entries are equivalent; compare their effective set.
+If a monitored JIT event occurs during timing, the entire sample block is saved
+as discarded and repeated after warmup. Individual slow samples are retained
+when no monitored compilation occurred.
 
 Run the current benchmark with each backend using identical checkpoints,
 environment and graph policy on an idle TP8 H100 node. The command below selects
@@ -245,13 +273,19 @@ for k in 1 2 3 4; do
     --draft-model /path/to/gemma4-assistant-FP8-block \
     --decode-backend latency_specialized \
     --k "$k" --output "results/mtp-k${k}.json" \
-    --input-lens 128 2048 20000 --batch-sizes 1 4 \
+    --input-lens 128 2048 20000 --batch-sizes 1 4
+  .venv/bin/python benchmarks/multi_turn/benchmark_gemma4_mtp.py \
+    --model /path/to/gemma4-31B-it-FP8-block \
+    --draft-model /path/to/gemma4-assistant-FP8-block \
+    --decode-backend latency_specialized \
+    --k "$k" --output "results/mtp-k${k}-quality.json" --quality-only \
     --gsm8k-train /path/to/gsm8k/train.jsonl \
     --gsm8k-test /path/to/gsm8k/test.jsonl --num-questions 32
 done
 ```
 
-The GSM8K options are optional and use the existing five-shot builder and scorer,
+Quality runs use actual drafting and standard rejection sampling, separately
+from performance runs. The GSM8K options use the existing five-shot builder and scorer,
 with thinking disabled and greedy sampling. Outputs include per-question
 correctness, truncation counts and token hashes for comparison. A 32-question
 screen is not a replacement for the full quality gate before deployment.
@@ -261,11 +295,16 @@ The `auto` backend leaves `target_full_chain` false. With the specialized
 backend it should be true on all ranks for this supported target. FP8 assistant
 Q/MLP consumer capabilities and norm producer enablement are recorded separately.
 
-To collect bounded kernel traces for the first input length at each batch size,
-add `--profile-dir /path/to/traces`. Profiling generates at most 16 output tokens
-after all timing and quality work, and does not enter the latency samples.
-Start with k=4, C1/C4 and `--output-len 16` to include both the first
-verification-shaped draft and later single-row draft calls.
+To trace every requested input length and batch size, add
+`--profile-dir /path/to/traces`. Each case warms up before capture and records
+monitored JIT events. Profiling defaults to Torch with shapes and 16 output
+tokens; `--profile-stack` adds Python stacks. Use `--profile-only` to skip the
+unprofiled timing loop, and `--profile-output-len 128` for a complete generation.
+`--profile-tool cuda` uses CUDA profiler start/stop ranges for Nsight Systems
+and adds NVTX ranges for target execution, drafting and sampling. Run Nsight
+with `--capture-range=cudaProfilerApi --capture-range-end=repeat` to retain all
+cases. Profiled durations are diagnostic and do not enter latency samples.
+Keep the same controlled acceptance schedule in baseline and candidate traces.
 
 For isolated fused-kernel measurements with real assistant weights, use:
 

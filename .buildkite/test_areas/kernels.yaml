@@ -352,6 +352,11 @@ steps:
   num_devices: 1
   timeout_in_minutes: 30
   source_file_dependencies:
+  - cmake/apply_git_patch.cmake
+  - cmake/external_projects/vllm_flash_attn.cmake
+  - cmake/patches/flash_attn_zero_window.patch
+  - cmake/patches/flash_attn_sm90_adaptive.patch
+  - vllm/models/gemma4/nvidia/specialized_decode/
   - csrc/attention/
   - csrc/core/vec_dtypes/
   - vllm/v1/attention

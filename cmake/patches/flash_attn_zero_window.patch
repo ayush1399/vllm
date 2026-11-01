@@ -1,0 +1,13 @@
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -464,8 +464,8 @@
+             0,
+             min(
+                 max_seqlen_k,
+-                (window_size_right or max_seqlen_k)
+-                + (window_size_left or max_seqlen_k)
++                (window_size_right if window_size_right is not None else max_seqlen_k)
++                + (window_size_left if window_size_left is not None else max_seqlen_k)
+                 + 1
+                 + tile_m,
+             ),

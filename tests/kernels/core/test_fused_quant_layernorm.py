@@ -683,6 +683,37 @@ def test_gemma4_full_chain_adapter_raw_boundary_and_fake(num_tokens, mode):
         assert torch.all(scales == expected_scale)
         assert torch.all(output.float() == expected_q)
 
+    if num_tokens < 32 and mode != 5:
+        from flashinfer.gemm.gemm_base import get_fp8_blockscale_gemm_runner_sm90
+
+        torch.manual_seed(123)
+        x.normal_()
+        residual.normal_()
+        weight.normal_()
+        expected_carry = torch.empty_like(carry)
+        normalized = torch.empty_like(x)
+        expected_q = torch.empty_like(output)
+        storage = torch.empty((42, (num_tokens + 3) // 4 * 4), device=x.device)
+        torch.ops._C.gemma4_full_chain_out(
+            x,
+            residual,
+            weight,
+            weight,
+            scalar,
+            expected_carry,
+            normalized,
+            storage,
+            6 if mode == 2 else mode + 3,
+            EPS,
+        )
+        get_fp8_blockscale_gemm_runner_sm90().fp8_quantize_1x128(
+            normalized, expected_q, storage, False
+        )
+        actual_carry, actual_q, actual_scales = full_chain(*args)
+        assert torch.equal(actual_carry, expected_carry)
+        assert torch.equal(actual_q.view(torch.uint8), expected_q.view(torch.uint8))
+        assert torch.equal(actual_scales, storage[:, :num_tokens].t())
+
 
 @pytest.mark.skipif(
     not current_platform.is_device_capability(90), reason="Gemma4 chain is SM90-only"
@@ -724,7 +755,7 @@ def test_gemma4_full_chain_rejects_unsafe_native_buffers(invalid):
     elif invalid == "alias":
         output = x
     elif invalid == "mode":
-        mode = 7
+        mode = 10
     with pytest.raises(RuntimeError):
         torch.ops._C.gemma4_full_chain_out(
             x, residual, weight, weight, scalar, carry, output, scales, mode, EPS
@@ -739,3 +770,37 @@ def test_gemma4_full_chain_rejects_zero_rows_in_fake():
     scalar = torch.empty(1, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="positive M"):
         fake(x, x, weight, weight, scalar, 0, EPS)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 chain is SM90-only"
+)
+@pytest.mark.parametrize("num_tokens", [5, 20, 128, 4096])
+@pytest.mark.parametrize("mode", [1, 2])
+@torch.inference_mode()
+def test_gemma4_compact_carry_preserves_full_precision_statistics(num_tokens, mode):
+    """Compact only an already rounded carry, retaining identical FP8 and scales."""
+    from vllm.models.gemma4.nvidia.specialized_decode.full_chain import full_chain
+
+    torch.manual_seed(714)
+    x = torch.randn(num_tokens, 5376, device="cuda", dtype=torch.bfloat16)
+    dtype = torch.bfloat16 if mode == 1 else torch.float32
+    residual = torch.randn_like(x, dtype=dtype)
+    post = torch.randn(5376, device="cuda", dtype=torch.bfloat16)
+    pre = torch.randn_like(post)
+    scalar = torch.full((1,), 0.875, device="cuda", dtype=torch.bfloat16)
+    graph = torch.cuda.CUDAGraph()
+    full_chain(x, residual, post, pre, scalar, mode, 1e-6, True)
+    with torch.cuda.graph(graph):
+        carry, q, scales = full_chain(x, residual, post, pre, scalar, mode, 1e-6, True)
+    for _ in range(3):
+        x.normal_()
+        residual.normal_()
+        graph.replay()
+        expected, expected_q, expected_scales = full_chain(
+            x, residual.float(), post, pre, scalar, mode, 1e-6
+        )
+        assert carry.dtype == (torch.bfloat16 if mode == 2 else torch.float32)
+        assert torch.equal(carry.float(), expected)
+        assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+        assert torch.equal(scales, expected_scales)
