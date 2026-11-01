@@ -626,3 +626,201 @@ def test_gemma4_mtp_fp8_runtime_fallback(num_tokens, normalize):
     error = (actual.float() - expected.float()).abs().sum(dim=-1)
     assert torch.isfinite(actual).all()
     assert torch.all(error <= expected.float().abs().sum(dim=-1) * 1e-3)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Gemma4 FP8 fusion is SM90-only",
+)
+@pytest.mark.parametrize("num_tokens", [1, 5, 20, 31, 32, 128, 4096])
+@pytest.mark.parametrize("width", [1024, 2688])
+@pytest.mark.parametrize("round_gate", [False, True])
+@torch.inference_mode()
+def test_gemma4_gelu_quant_preserves_cutlass_rounding(num_tokens, width, round_gate):
+    """Keep both BF16 roundings before raw-scale CUTLASS FP8 quantization."""
+    from flashinfer.gemm.gemm_base import get_fp8_blockscale_gemm_runner_sm90
+
+    from vllm.models.gemma4.nvidia.specialized_decode.activation import gelu_quant
+
+    torch.manual_seed(42)
+    x = torch.randn((num_tokens, 2 * width), device="cuda", dtype=torch.bfloat16)
+    activated = x.new_empty((num_tokens, width))
+    if round_gate:
+        torch.ops._C.gelu_tanh_and_mul(activated, x)
+    else:
+        activated = _compiled_gemma4_gelu_mul(x)
+    expected = torch.empty_like(activated, dtype=torch.float8_e4m3fn)
+    storage = torch.empty((width // 128, (num_tokens + 3) // 4 * 4), device=x.device)
+    if num_tokens < 32:
+        get_fp8_blockscale_gemm_runner_sm90().fp8_quantize_1x128(
+            activated, expected, storage, False
+        )
+    else:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8,
+        )
+
+        expected, reference_scales = per_token_group_quant_fp8(
+            activated,
+            128,
+            column_major_scales=True,
+            tma_aligned_scales=True,
+            use_ue8m0=True,
+        )
+        storage[:, :num_tokens].copy_(reference_scales.t())
+    actual, scales = gelu_quant(x, round_gate)
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scales, storage[:, :num_tokens].t())
+    assert scales.stride() == (1, (num_tokens + 3) // 4 * 4)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Gemma4 FP8 fusion is SM90-only",
+)
+@pytest.mark.parametrize("num_tokens", [1, 20, 32, 128])
+@pytest.mark.parametrize("round_gate", [False, True])
+@torch.inference_mode()
+def test_gemma4_gelu_down_projection_preserves_dispatch(num_tokens, round_gate):
+    """Small-row fusion and the prefill fallback preserve the local projection."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.models.gemma4.nvidia.specialized_decode.activation import (
+        gelu_down_projection,
+    )
+
+    torch.manual_seed(42)
+    x = torch.randn((num_tokens, 2048), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((128, 1024), device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.full((1, 8), 1 / 128, device="cuda")
+    weight, scales = deepgemm_post_process_fp8_weight_block(
+        weight, scales, (128, 128), use_e8m0=True
+    )
+    activated = x.new_empty((num_tokens, 1024))
+    if round_gate:
+        torch.ops._C.gelu_tanh_and_mul(activated, x)
+    else:
+        activated = _compiled_gemma4_gelu_mul(x)
+    expected = torch.ops.vllm.dynamic_flashinfer_deepgemm_blockscale_gemm(
+        activated, weight, scales, 128, True
+    )
+    actual = gelu_down_projection(x, weight, scales, round_gate)
+    assert torch.equal(actual, expected)
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _compiled_gemma4_gelu_mul(x):
+    width = x.shape[-1] // 2
+    return torch.nn.functional.gelu(x[:, :width], approximate="tanh") * x[:, width:]
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Gemma4 PDL uses SM90 instructions",
+)
+@pytest.mark.parametrize("num_tokens", [1, 5, 8, 16, 20, 24, 31, 32, 128])
+@pytest.mark.parametrize("n", [2048, 5376])
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@torch.inference_mode()
+def test_gemma4_norm_gemm_graph_reads_current_normalized_inputs(num_tokens, n, mode):
+    """PDL and the prefill fallback preserve carry/GEMM outputs after input changes."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.models.gemma4.nvidia.specialized_decode import linear, pdl  # noqa: F401
+    from vllm.models.gemma4.nvidia.specialized_decode.full_chain import full_chain
+
+    torch.manual_seed(714)
+    x = torch.randn(num_tokens, 5376, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x, dtype=torch.bfloat16 if mode == 0 else torch.float32)
+    post = (1 + 0.1 * torch.randn(5376, device="cuda")).bfloat16()
+    pre = (1 + 0.1 * torch.randn(5376, device="cuda")).bfloat16()
+    scalar = torch.full((1,), 0.875, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, 5376, device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.rand(n // 128, 42, device="cuda") / 5376**0.5
+    weight, ws = deepgemm_post_process_fp8_weight_block(
+        weight,
+        ws,
+        (128, 128),
+        use_e8m0=True,
+    )
+    assert pdl.initialize(x.device)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        args = (x, residual, post, pre, scalar, weight, ws, mode)
+        torch.ops.vllm.gemma4_norm_gemm(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            carry, output = torch.ops.vllm.gemma4_norm_gemm(*args)
+        for _ in range(4):
+            x.copy_(torch.randn_like(x))
+            residual.copy_(torch.randn_like(residual))
+            graph.replay()
+            expected_carry, q, scales = full_chain(
+                x,
+                residual,
+                post,
+                pre,
+                scalar,
+                mode,
+                1e-6,
+            )
+            expected = torch.ops.vllm.flashinfer_deepgemm_blockscale_gemm_fp8_input(
+                q,
+                scales,
+                weight,
+                ws,
+            )
+            torch.testing.assert_close(carry, expected_carry, rtol=0, atol=0)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Gemma4 split K uses SM90"
+)
+@pytest.mark.parametrize("num_tokens", [1, 5, 8])
+@torch.inference_mode()
+def test_gemma4_qkv_partitions_preserve_projection_after_graph_replay(num_tokens):
+    """The QKV consumer receives current FP32 partitions and a lossless BF16 carry."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.models.gemma4.nvidia.specialized_decode import linear, pdl  # noqa: F401
+    from vllm.models.gemma4.nvidia.specialized_decode.full_chain import full_chain
+
+    torch.manual_seed(714)
+    x = torch.randn(num_tokens, 5376, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x, dtype=torch.float32)
+    post = torch.randn(5376, device="cuda", dtype=torch.bfloat16)
+    pre = torch.randn_like(post)
+    scalar = torch.full((1,), 0.875, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(2048, 5376, device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.rand(16, 42, device="cuda") / 5376**0.5
+    weight, ws = deepgemm_post_process_fp8_weight_block(
+        weight, ws, (128, 128), use_e8m0=True
+    )
+    args = (x, residual, post, pre, scalar, weight, ws, 2, True)
+    torch.ops.vllm.gemma4_norm_qkv_partials(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        carry, partials = torch.ops.vllm.gemma4_norm_qkv_partials(*args)
+    assert partials.dtype == torch.float32
+    assert partials.shape == (6, num_tokens, 2048)
+    for _ in range(3):
+        x.normal_()
+        residual.normal_()
+        graph.replay()
+        expected_carry, q, scales = full_chain(
+            x, residual, post, pre, scalar, 2, 1e-6, True
+        )
+        expected = torch.ops.vllm.flashinfer_deepgemm_blockscale_gemm_fp8_input(
+            q, scales, weight, ws
+        )
+        assert torch.equal(carry, expected_carry)
+        total = torch.zeros_like(partials[0])
+        for part in partials.unbind(0):
+            total.add_(part)
+        torch.testing.assert_close(total, expected.float(), rtol=0.01, atol=2e-5)

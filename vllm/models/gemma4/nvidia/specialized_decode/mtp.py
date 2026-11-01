@@ -16,11 +16,14 @@ from vllm.model_executor.models.gemma4_mtp import (
 )
 from vllm.sequence import IntermediateTensors
 
+from .attention import SpecializedGemma4MTPAttention
 from .mtp_kernels import maybe_mtp_fp8_gemv
 from .norm import _maybe_gemma4_hybrid_norm_quant
 
 
 class SpecializedGemma4MTPDecoderLayer(Gemma4MTPDecoderLayer):
+    attention_layer_cls = SpecializedGemma4MTPAttention
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fuse_norm_quant = True

@@ -580,6 +580,9 @@ class Gemma4Attention(nn.Module):
 
 
 class Gemma4DecoderLayer(nn.Module):
+    attention_layer_cls = Gemma4Attention
+    mlp_layer_cls = Gemma4MLP
+
     def __init__(
         self,
         config,
@@ -601,7 +604,7 @@ class Gemma4DecoderLayer(nn.Module):
         head_dim = layer_config.head_dim
         num_kv_heads = layer_config.num_key_value_heads
 
-        self.self_attn = Gemma4Attention(
+        self.self_attn = self.attention_layer_cls(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -628,7 +631,7 @@ class Gemma4DecoderLayer(nn.Module):
             2 if use_double_wide_mlp else 1
         )
 
-        self.mlp = Gemma4MLP(
+        self.mlp = self.mlp_layer_cls(
             hidden_size=self.hidden_size,
             intermediate_size=layer_intermediate_size,
             hidden_activation=config.hidden_activation,

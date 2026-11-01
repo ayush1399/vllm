@@ -34,6 +34,40 @@ SOFT_CAPS = [None]
 SLIDING_WINDOWS = [None, 256]
 
 
+@pytest.mark.parametrize("window", [(1023, 0), (0, 1023)])
+@pytest.mark.parametrize("max_seqlen_k", [20000, 100000])
+@pytest.mark.parametrize("num_splits", [0, 32])
+def test_fa4_split_selection_preserves_zero_window(window, max_seqlen_k, num_splits):
+    """A zero-width side must not inflate the local attention split budget."""
+    if not current_platform.is_cuda():
+        pytest.skip("FA4 requires CUDA")
+    fa4 = pytest.importorskip("vllm.vllm_flash_attn.cute.interface")
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    config = fa4._get_fwd_config(
+        arch=90,
+        head_dim=256,
+        head_dim_v=256,
+        max_seqlen_q=5,
+        max_seqlen_k=max_seqlen_k,
+        num_head_kv=2,
+        qhead_per_kvhead=2,
+        pack_gqa=True,
+        batch_size=1,
+        causal=False,
+        local=True,
+        window_size_left=window[0],
+        window_size_right=window[1],
+        num_splits=num_splits,
+        device=device,
+    )
+    loaded = sum(window) + 1 + config.m_block_size
+    nblocks = (loaded + config.n_block_size - 1) // config.n_block_size
+    expected = num_splits or fa4.num_splits_heuristic(
+        2, fa4.get_num_sms_for_selection(device.index, 90), nblocks, 128
+    )
+    assert config.num_splits == expected
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -290,3 +324,181 @@ def test_fa4_hd256_paged_call_shape(
         sliding_window=sliding_window,
     )
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Adaptive SplitKV is SM90-only",
+)
+@pytest.mark.parametrize(
+    "head_dim,kv_heads,window", [(256, 2, (1023, 0)), (512, 1, (-1, -1))]
+)
+@pytest.mark.parametrize("batch_size", [1, 4])
+@torch.inference_mode()
+def test_fa4_adaptive_splits_read_current_sequence_lengths_after_graph_replay(
+    head_dim, kv_heads, window, batch_size
+):
+    """A captured large-context graph must adapt to each request's current KV length."""
+    set_random_seed(714)
+    query, maximum, page_size = 5, 20000, 16
+    pages = (maximum + page_size - 1) // page_size
+    q = torch.randn(
+        batch_size * query, 4, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        batch_size * pages,
+        page_size,
+        kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    cu = torch.arange(
+        0, (batch_size + 1) * query, query, device="cuda", dtype=torch.int32
+    )
+    lengths = torch.full((batch_size,), maximum, device="cuda", dtype=torch.int32)
+    blocks = torch.arange(batch_size * pages, device="cuda", dtype=torch.int32).view(
+        batch_size, pages
+    )
+
+    def attention(splits):
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            query,
+            cu,
+            maximum,
+            seqused_k=lengths,
+            softmax_scale=1.0,
+            causal=True,
+            window_size=window,
+            block_table=blocks,
+            num_splits=splits,
+            fa_version=4,
+        )
+
+    attention(-1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = attention(-1)
+    for sizes in (
+        [128, 256, 4096, 20000],
+        [20000, 4096, 256, 128],
+        [257, 1025, 4097, 16385],
+    ):
+        lengths.copy_(
+            torch.tensor(sizes[:batch_size], device="cuda", dtype=torch.int32)
+        )
+        q.normal_()
+        graph.replay()
+        expected = attention(1)
+        relative_l1 = (
+            actual.float() - expected.float()
+        ).abs().sum() / expected.float().abs().sum()
+        assert relative_l1 < 0.01
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Gemma4 combine quantization is SM90-only",
+)
+@pytest.mark.parametrize(
+    "head_dim,kv_heads,window", [(256, 2, (1023, 0)), (512, 1, (-1, -1))]
+)
+@pytest.mark.parametrize("batch_size", [1, 4])
+@torch.inference_mode()
+def test_fa4_combine_quant_preserves_bf16_rounding_after_graph_replay(
+    head_dim, kv_heads, window, batch_size
+):
+    """Combine current splits and quantize the BF16 result under changing contexts."""
+    from flashinfer.gemm.gemm_base import get_fp8_blockscale_gemm_runner_sm90
+
+    from vllm import _custom_ops  # noqa: F401
+    from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+
+    set_random_seed(714)
+    query, maximum, page_size = 5, 20000, 16
+    rows, width = batch_size * query, 4 * head_dim
+    pages = maximum // page_size
+    q = torch.randn(rows, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(
+        batch_size * pages,
+        page_size,
+        kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    cu = torch.arange(
+        0, (batch_size + 1) * query, query, device="cuda", dtype=torch.int32
+    )
+    lengths = torch.full((batch_size,), maximum, device="cuda", dtype=torch.int32)
+    blocks = torch.arange(batch_size * pages, device="cuda", dtype=torch.int32).view(
+        batch_size, pages
+    )
+    actual = torch.empty(rows, 4, head_dim, device="cuda", dtype=torch.float8_e4m3fn)
+    scales = torch.empty(width // 128, (rows + 3) // 4 * 4, device="cuda")
+
+    def fused():
+        return _flash_attn_fwd(
+            q,
+            k,
+            v,
+            out=actual,
+            output_block_scale=scales,
+            cu_seqlens_q=cu,
+            max_seqlen_q=query,
+            max_seqlen_k=maximum,
+            seqused_k=lengths,
+            page_table=blocks,
+            softmax_scale=1.0,
+            causal=True,
+            window_size_left=window[0] if window[0] >= 0 else None,
+            window_size_right=window[1] if window[1] >= 0 else None,
+            num_splits=-1,
+        )
+
+    fused()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused()
+    for sizes in ([128, 256, 4096, 20000], [20000, 4096, 256, 128]):
+        lengths.copy_(
+            torch.tensor(sizes[:batch_size], device="cuda", dtype=torch.int32)
+        )
+        q.normal_().mul_(0.125)
+        graph.replay()
+        reference = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            query,
+            cu,
+            maximum,
+            seqused_k=lengths,
+            softmax_scale=1.0,
+            causal=True,
+            window_size=window,
+            block_table=blocks,
+            num_splits=0,
+            fa_version=4,
+        )
+        expected = torch.empty_like(actual)
+        reference_scales = torch.empty_like(scales)
+        get_fp8_blockscale_gemm_runner_sm90().fp8_quantize_1x128(
+            reference.view(rows, width),
+            expected.view(rows, width),
+            reference_scales,
+            False,
+        )
+        a = actual.view(rows, width).float() * scales[:, :rows].t().repeat_interleave(
+            128, 1
+        )
+        b = expected.view(rows, width).float() * reference_scales[
+            :, :rows
+        ].t().repeat_interleave(128, 1)
+        relative_l1 = (a - b).abs().sum() / b.abs().sum()
+        assert relative_l1 < 1e-4

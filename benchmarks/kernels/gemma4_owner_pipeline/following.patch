@@ -1,0 +1,91 @@
+--- a/fp8_gemm_impl.cuh
++++ b/fp8_gemm_impl.cuh
+@@ -439,7 +439,7 @@
+ template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+           uint32_t kNumGroups, uint32_t kNumStages, uint32_t kNumTMAThreads,
+           uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast, typename SchedulerType,
+-          typename InputType>
++          typename InputType, bool WaitRows = false>
+ __global__ void __launch_bounds__(
+     get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
+     fp8_gemm_kernel_swapAB(
+@@ -448,7 +448,8 @@
+         const __grid_constant__ CUtensorMap tensor_map_b,  // act (previously weight)
+         const __grid_constant__ CUtensorMap
+             tensor_map_scales_b,  // act scales (previously tensor_map_scales_a)
+-        const __grid_constant__ CUtensorMap tensor_map_d) {
++        const __grid_constant__ CUtensorMap tensor_map_d,
++    uint32_t* ready, uint32_t* expected, int* error, int alias, uint64_t* ready_peers, int rank) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
+   // Scaling checks
+   DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
+@@ -577,6 +578,8 @@
+ 
+     // NOTES: only one thread (or warp) will be used
+     if (threadIdx.x == kNumMathThreads) {
++      uint32_t epoch = 0;
++      if constexpr (WaitRows) { if(alias >= 0) epoch = ++expected[blockIdx.x]; }
+       // Persistently schedule over blocks
+       while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+         launch_k_iterations([&](int k_iter, auto type) {
+@@ -585,17 +588,56 @@
+               kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+           DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+ 
++          // Stage independent weights before waiting for remotely produced X.
+ #pragma unroll
+           for (uint32_t s = 0; s < kNumInnerStages; ++s) {
+-            // Wait consumer release
+             empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+-
+-            // Issue TMA A (weight) now without broadcasting
+             auto& full_barrier = *full_barriers[s];
+             int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+             tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
+                      scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
+-
++          }
++          if constexpr (WaitRows) {
++            if (k_iter == 0) {
++              if (alias == -1) {
++                cudaGridDependencySynchronize();
++              } else {
++              const uint64_t start = clock64();
++              if (alias == 2) {
++                cudaGridDependencySynchronize();
++                if (blockIdx.x == 0 && scheduler.current_iter == 0) {
++                  asm volatile("fence.proxy.alias;" ::: "memory");
++                  asm volatile("fence.acq_rel.sys;" ::: "memory");
++                  for (int dst = 0; dst < 8; ++dst) {
++                    const uint64_t addr = ready_peers[dst] + rank * 4;
++                    asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
++                                 :: "l"(addr), "r"(epoch) : "memory");
++                  }
++                }
++              }
++              const int begin = alias == 2 ? 0 : scheduler.get_global_n_idx(n_block_idx);
++              const int end = alias == 2 ? 8 : min(begin + BLOCK_N, int(problem_input.shape_n));
++              for (int row = begin; row < end; ++row) {
++                uint32_t got;
++                do {
++                  asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
++                               : "=r"(got) : "l"(ready + row) : "memory");
++                  if (clock64() - start > 2000000000ULL) {
++                    atomicExch(error, 2);
++                    break;
++                  }
++                  if (got != epoch) __nanosleep(32);
++                } while (got != epoch);
++              }
++              if (alias == 1) asm volatile("fence.proxy.alias;" ::: "memory");
++              asm volatile("fence.proxy.async.global;" ::: "memory");
++              }
++            }
++          }
++#pragma unroll
++          for (uint32_t s = 0; s < kNumInnerStages; ++s) {
++            auto& full_barrier = *full_barriers[s];
++            int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+             // Issue TMA B (act) with broadcasting
+             tma_copy<kNumTMAMulticast>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                        smem_b[s], k_idx, scheduler.get_global_n_idx(n_block_idx));

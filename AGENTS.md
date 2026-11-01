@@ -102,6 +102,9 @@ When adding tests:
   `benchmarks/kernels/`; prove correctness in existing pytest suites.
 - **Run model evals for model-affecting changes.** Search `tests/evals/` or use
   `vllm bench` and include results in the PR — do not wait for reviewers to ask.
+- **Control speculative acceptance in performance tests.** Use the same fixed
+  acceptance schedule for baseline and candidate, and report it. Use real
+  drafting and rejection sampling for quality tests.
 
 For model-specific requirements, see
 [`docs/contributing/model/tests.md`](docs/contributing/model/tests.md).

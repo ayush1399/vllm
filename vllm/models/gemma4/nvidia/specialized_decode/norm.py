@@ -15,6 +15,18 @@ from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def preserve_bf16_intermediates() -> bool:
+    """Match native execution or Inductor's optional precision casts."""
+    if not torch.compiler.is_compiling():
+        return True
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config().compilation_config
+    return config.backend != "inductor" or bool(
+        config.inductor_compile_config.get("emulate_precision_casts", False)
+    )
+
+
 def _gemma4_hybrid_rms_quant(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> tuple[torch.Tensor, torch.Tensor]:

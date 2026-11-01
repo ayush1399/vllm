@@ -5,6 +5,19 @@
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 
 
+def pdl_enabled() -> bool:
+    config = get_current_vllm_config_or_none()
+    if config is None or not specialized_decode_enabled(config):
+        return False
+    extra = config.additional_config
+    if not isinstance(extra, dict):
+        return False
+    enabled = extra.get("gemma4_pdl", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("gemma4_pdl must be a boolean")
+    return enabled
+
+
 def specialized_decode_enabled(
     vllm_config: VllmConfig | None = None, *, validate: bool = False
 ) -> bool:

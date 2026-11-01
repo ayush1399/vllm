@@ -1,0 +1,66 @@
+--- a/fp8_gemm_impl.cuh
++++ b/fp8_gemm_impl.cuh
+@@ -439,7 +439,7 @@
+ template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+           uint32_t kNumGroups, uint32_t kNumStages, uint32_t kNumTMAThreads,
+           uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast, typename SchedulerType,
+-          typename InputType>
++          typename InputType, bool PublishMailbox = false, bool ScatterMailbox = false>
+ __global__ void __launch_bounds__(
+     get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
+     fp8_gemm_kernel_swapAB(
+@@ -448,8 +448,9 @@
+         const __grid_constant__ CUtensorMap tensor_map_b,  // act (previously weight)
+         const __grid_constant__ CUtensorMap
+             tensor_map_scales_b,  // act scales (previously tensor_map_scales_a)
+-        const __grid_constant__ CUtensorMap tensor_map_d) {
++        const __grid_constant__ CUtensorMap tensor_map_d, uint64_t mailbox_mc, int capacity, int parity, int rank) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
++  
+   // Scaling checks
+   DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
+   DG_STATIC_ASSERT(ceil_div(BLOCK_M, BLOCK_K) == 1, "Too much A scales in a single block");
+@@ -803,12 +804,37 @@
+       } else {
+         cute::tma_store_fence();
+         cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+-        // Use TMA store to write back to global memory
+-        if (threadIdx.x == 0) {
+-          cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, m_block_idx * BLOCK_M,
+-                                        scheduler.get_global_n_idx(n_block_idx));
+-          cute::tma_store_arrive();
+-          cute::tma_store_wait<0>();
++        if constexpr (PublishMailbox) {
++          for (int v = threadIdx.x; v < BLOCK_M * BLOCK_N / 8; v += kNumMathThreads) {
++            const int row = scheduler.get_global_n_idx(n_block_idx) + v / (BLOCK_M / 8);
++            const int col = m_block_idx * BLOCK_M + (v % (BLOCK_M / 8)) * 8;
++            if (row < problem_input.shape_n && col < SHAPE_M) {
++              uint4 payload = reinterpret_cast<const uint4*>(smem_d)[v];
++              payload.x = payload.x == 0x80000000u ? 0u : payload.x;
++              payload.y = payload.y == 0x80000000u ? 0u : payload.y;
++              payload.z = payload.z == 0x80000000u ? 0u : payload.z;
++              payload.w = payload.w == 0x80000000u ? 0u : payload.w;
++              if constexpr (ScatterMailbox) {
++                const uint64_t owner_base = reinterpret_cast<const uint64_t*>(mailbox_mc)[row % 8];
++                uint64_t addr = owner_base + (((uint64_t(parity) * 8 + rank) * ((capacity+7)/8) + row/8) * SHAPE_M + col) * 2;
++                asm volatile("st.relaxed.sys.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
++                              "l"(addr),"r"(payload.x),"r"(payload.y),"r"(payload.z),"r"(payload.w):"memory");
++              } else {
++              uint64_t addr = mailbox_mc + (((uint64_t(parity) * 8 + rank) * capacity + row) * SHAPE_M + col) * 2;
++              asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};" ::
++                           "l"(addr), "f"(__uint_as_float(payload.x)), "f"(__uint_as_float(payload.y)),
++                           "f"(__uint_as_float(payload.z)), "f"(__uint_as_float(payload.w)) : "memory");
++              }
++            }
++          }
++          cutlass::arch::NamedBarrier(kNumMathThreads).sync();
++        } else {
++          if (threadIdx.x == 0) {
++            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, m_block_idx * BLOCK_M,
++                                          scheduler.get_global_n_idx(n_block_idx));
++            cute::tma_store_arrive();
++            cute::tma_store_wait<0>();
++          }
+         }
+       }
+ 

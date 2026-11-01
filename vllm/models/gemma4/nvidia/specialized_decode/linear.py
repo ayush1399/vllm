@@ -29,6 +29,22 @@ class SpecializedFp8BlockScaledKernel(FlashInferFp8DeepGEMMDynamicBlockScaledKer
     def process_weights_after_loading(self, layer: torch.nn.Module):
         super().process_weights_after_loading(layer)
         layer._flashinfer_fp8_input_ue8m0 = self.fallback.use_deep_gemm_e8m0
+        from .config import pdl_enabled
+
+        params = self._get_layer_params(layer)
+        layer._gemma4_pdl = False
+        if (
+            pdl_enabled()
+            and layer.bias is None
+            and not getattr(layer, "gather_output", False)
+            and params.weight.shape in ((5376, 5376), (2048, 5376))
+            and params.weight.is_contiguous()
+            and params.block_scale.dtype == torch.float32
+            and params.block_scale.is_contiguous()
+        ):
+            from .pdl import initialize
+
+            layer._gemma4_pdl = initialize(params.weight.device)
 
     def apply_weights(
         self,

@@ -1,0 +1,268 @@
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -687,6 +687,7 @@
+     gather_kv_indices: Optional[torch.Tensor] = None,
+     gather_kv_valid_length: Optional[torch.Tensor] = None,
+     output_scale: Optional[torch.Tensor] = None,
++    output_block_scale: Optional[torch.Tensor] = None,
+     compile_only: bool = False,
+     fp8_kv_dequant: bool = False,
+     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+@@ -867,7 +868,7 @@
+         output_quant_key = "kFp8StaticTensorSym"
+         output_scale = output_scale.reshape(1)
+     else:
+-        out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
++        out_torch_dtype = torch.float8_e4m3fn if output_block_scale is not None else (torch.bfloat16 if is_fp8 else q_dtype)
+         output_quant_key = None
+     device = v.device
+     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+@@ -971,6 +972,12 @@
+     if cu_seqlens_k is None and seqused_k is None:
+         min_seqlen_k = seqlen_k
+ 
++    adaptive_sm90_splits = (
++        num_splits == -1 and arch // 10 == 9 and max_seqlen_q <= 32
++        and page_table is not None and seqused_k is not None
++        and dynamic_causal is None and block_sparse_tensors is None
++        and not fp8_kv_dequant and not requires_grad
++    )
+     fwd_cfg = _get_fwd_config(
+         arch=arch,
+         head_dim=head_dim,
+@@ -1048,6 +1055,11 @@
+         num_splits = decode_splits[1]
+ 
+     is_split_kv = num_splits > 1
++    adaptive_sm90_splits = adaptive_sm90_splits and is_split_kv
++    if output_block_scale is not None:
++        assert adaptive_sm90_splits and cu_seqlens_q is not None
++        assert not return_lse and not requires_grad
++
+     if is_split_kv:
+         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
+         lse_partial_shape = (
+@@ -1343,6 +1355,9 @@
+         virtual_batch_idx = None
+         num_nheads_in_l2 = None
+         tile_count_semaphore = None
++
++    if adaptive_sm90_splits:
++        num_splits_dynamic = torch.empty((batch_size,), device=device, dtype=torch.int32)
+ 
+     # use binary batch search in SingleTileVarlenScheduler to avoid
+     # O(N^2) lookup; observed to be faster only for batch_size > BIN_BATCH_SEARCH_THRESH; this is tunable
+@@ -1490,6 +1505,7 @@
+         out_torch_dtype,
+         # the decode kernel is a different class with a different grid and smem plan
+         decode_splits,
++        adaptive_sm90_splits,
+     )
+     if use_dedicated_hd256_kernel:
+         compile_key += (
+@@ -1638,6 +1654,7 @@
+                 output_quant_key=output_quant_key if not is_split_kv else None,
+                 kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
+                 fp8_kv_dequant=fp8_kv_dequant,
++                adaptive_splits=adaptive_sm90_splits,
+             )
+         elif arch // 10 in [10, 11]:
+             if output_quant_key is not None:
+@@ -1861,6 +1878,8 @@
+                     cu_total_m_blocks_tensor,
+                     cu_total_splits_m_blocks_tensor,
+                 ])
++            if arch // 10 == 9:
++                compile_args.append(num_splits_dynamic_tensor)
+             compile_args.append(current_stream)
+             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
+ 
+@@ -1986,9 +2005,15 @@
+                     cu_total_m_blocks,
+                     cu_total_splits_m_blocks,
+                 ])
++            if arch // 10 == 9:
++                call_args.append(num_splits_dynamic)
+             _flash_attn_fwd.compile_cache[compile_key](*call_args)
+     if is_split_kv:
+-        if use_sparse_decode:
++        if output_block_scale is not None:
++            torch.ops._C.gemma4_combine_quant_out(
++                out_partial, lse_partial, cu_seqlens_q, num_splits_dynamic, out, output_block_scale
++            )
++        elif use_sparse_decode:
+             # decode partials are per token row: one batch of length total_q, no cu_seqlens
+             _flash_attn_fwd_combine(
+                 out_partial.unsqueeze(1),                    # (S, 1, total_q, h, dv)
+@@ -2008,7 +2033,7 @@
+                 lse.transpose(-1, -2) if lse is not None else None,
+                 cu_seqlens_q,
+                 seqused_q,
+-                num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata else None,
++                num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata or adaptive_sm90_splits else None,
+                 virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
+                 output_scale=output_scale,
+                 _arch=arch,
+--- a/flash_attn/cute/flash_fwd_sm90.py
++++ b/flash_attn/cute/flash_fwd_sm90.py
+@@ -57,6 +57,7 @@
+         mma_pv_is_rs: bool = True,
+         paged_kv_non_tma: bool = False,
+         is_split_kv: bool = False,
++        adaptive_splits: bool = False,
+         kv_dtype=None,
+         fp8_kv_dequant: bool = False,
+         **kwargs,
+@@ -65,6 +66,7 @@
+         assert self.output_quant_key is None, (
+             f"Fused quant output not implemented for {type(self).__name__}"
+         )
++        self.adaptive_splits = adaptive_splits
+         self.intra_wg_overlap = intra_wg_overlap
+         self.mma_pv_is_rs = mma_pv_is_rs
+         self.buffer_align_bytes = 1024
+@@ -189,6 +191,24 @@
+             sP: sP_struct
+ 
+         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
++
++    @cute.jit
++    def effective_splits(self, seqlen, maximum, block_info):
++        length = seqlen.seqlen_k
++        if const_expr(self.is_local and block_info.window_size_left is not None):
++            length = cutlass.min(
++                length, block_info.window_size_left + block_info.window_size_right + 1 + self.tile_m
++            )
++        return cutlass.min(maximum, cutlass.max(Int32(4), cute.ceil_div(length, self.tile_n)))
++
++    @cute.jit
++    def valid_split(self, work_tile, maximum, block_info, SeqlenInfoCls):
++        valid = work_tile.is_valid_tile
++        if const_expr(self.adaptive_splits):
++            if valid:
++                _, _, batch_idx, split_idx = work_tile.tile_idx
++                valid = split_idx < self.effective_splits(SeqlenInfoCls(batch_idx), maximum, block_info)
++        return valid
+ 
+     @cute.jit
+     def __call__(
+@@ -215,6 +235,7 @@
+         output_scale: Optional[cute.Tensor] = None,
+         mCuTotalMBlocks: Optional[cute.Tensor] = None,
+         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
++        mAdaptiveSplits: Optional[cute.Tensor] = None,
+         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+         stream: cuda.CUstream = None,
+     ):
+@@ -502,6 +523,7 @@
+             fastdiv_mods,
+             output_scale,
+             descale_tensors,
++            mAdaptiveSplits,
+         ).launch(
+             grid=grid_dim,
+             block=[self.num_threads, 1, 1],
+@@ -553,6 +575,7 @@
+         fastdiv_mods=None,
+         output_scale: Optional[cute.Tensor] = None,
+         descale_tensors=None,
++        mAdaptiveSplits: Optional[cute.Tensor] = None,
+     ):
+         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+         # Prefetch tma descriptor
+@@ -689,6 +712,7 @@
+             window_size_right,
+             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+             num_splits=num_splits,
++            pack_split_idx=self.adaptive_splits,
+         )
+         SeqlenInfoCls = partial(
+             SeqlenInfoQK.create,
+@@ -720,6 +744,14 @@
+         )
+         self._mDynamicCausal = mDynamicCausal
+         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
++        if const_expr(self.adaptive_splits):
++            first_tile = TileSchedulerCls().initial_work_tile_info()
++            if first_tile.is_valid_tile:
++                first_m, first_head, first_batch, first_split = first_tile.tile_idx
++                count = self.effective_splits(SeqlenInfoCls(first_batch), num_splits, block_info)
++                if first_m == 0 and first_head == 0 and first_split == 0:
++                    if cute.arch.thread_idx()[0] == 0:
++                        mAdaptiveSplits[first_batch] = count
+ 
+         # Cluster wait before starting
+         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+@@ -822,9 +854,12 @@
+         stage_producer_phase = Int32(1)
+         tile_scheduler = TileSchedulerCls()
+         work_tile = tile_scheduler.initial_work_tile_info()
+-        while work_tile.is_valid_tile:
++        while self.valid_split(work_tile, num_splits, block_info, SeqlenInfoCls):
+             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+             seqlen = SeqlenInfoCls(batch_idx)
++            range_split_idx = split_idx
++            if const_expr(self.adaptive_splits):
++                range_split_idx = (self.effective_splits(seqlen, num_splits, block_info) << 16) | split_idx
+             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+             head_idx_kv = (
+                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+@@ -857,7 +892,7 @@
+             )
+ 
+             n_block_min, n_block_max = block_info.get_n_block_min_max(
+-                seqlen, m_block, split_idx, num_splits
++                seqlen, m_block, range_split_idx, num_splits
+             )
+ 
+             # ---- Prologue emit: stage K[n_block_max - 1] (warp 0 only) ----
+@@ -971,10 +1006,13 @@
+             )
+             tile_scheduler = TileSchedulerCls()
+             work_tile = tile_scheduler.initial_work_tile_info()
+-            while work_tile.is_valid_tile:
++            while self.valid_split(work_tile, num_splits, block_info, SeqlenInfoCls):
+                 # if work_tile.is_valid_tile:
+                 m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+                 seqlen = SeqlenInfoCls(batch_idx)
++                range_split_idx = split_idx
++                if const_expr(self.adaptive_splits):
++                    range_split_idx = (self.effective_splits(seqlen, num_splits, block_info) << 16) | split_idx
+                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+                 head_idx_kv = (
+                     head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+@@ -1062,7 +1100,7 @@
+ 
+                 if const_expr(not self.use_block_sparsity):
+                     n_block_min, n_block_max = block_info.get_n_block_min_max(
+-                        seqlen, m_block, split_idx, num_splits
++                        seqlen, m_block, range_split_idx, num_splits
+                     )
+                     if const_expr(self._mDynamicCausal is not None):
+                         psc_producer = self._mDynamicCausal[batch_idx]
+@@ -1427,12 +1465,15 @@
+             acc_O=acc_O,
+             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
+         )
+-        while work_tile.is_valid_tile:
++        while self.valid_split(work_tile, num_splits, block_info, SeqlenInfoCls):
+             # if work_tile.is_valid_tile:
+ 
+             # shape: (atom_v_m * rest_m)
+             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+             seqlen = SeqlenInfoCls(batch_idx)
++            range_split_idx = split_idx
++            if const_expr(self.adaptive_splits):
++                range_split_idx = (self.effective_splits(seqlen, num_splits, block_info) << 16) | split_idx
+ 
+             softmax_tile = softmax
+             softmax_scale_eff = softmax_scale
+@@ -1514,7 +1555,7 @@
+                 score_mod_fn=score_mod_fn,
+             )
+             n_block_min, n_block_max = block_info.get_n_block_min_max(
+-                seqlen, m_block, split_idx, num_splits
++                seqlen, m_block, range_split_idx, num_splits
+             )
+             if const_expr(self._mDynamicCausal is not None):
+                 # Per-sequence causal: psc == 0 means this sequence is processed

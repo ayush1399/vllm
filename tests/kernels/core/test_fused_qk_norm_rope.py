@@ -146,3 +146,207 @@ def test_fused_qk_norm_rope_matches_reference(
         atol=ATOL,
         rtol=RTOL,
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Gemma4 preparation is SM90-only",
+)
+@pytest.mark.parametrize("num_tokens", [1, 5, 20, 128, 4096])
+@pytest.mark.parametrize(
+    "head_dim,num_kv_heads", [(256, 0), (256, 2), (512, 0), (512, 1)]
+)
+@pytest.mark.parametrize("round_before_weight", [False, True])
+@torch.inference_mode()
+def test_gemma4_preparation_preserves_native_qkv(
+    default_vllm_config, num_tokens, head_dim, num_kv_heads, round_before_weight
+):
+    """Fuse Q/K/V norm and padded proportional RoPE without changing BF16 outputs."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.rotary_embedding.gemma4_rope import (
+        Gemma4RotaryEmbedding,
+    )
+    from vllm.models.gemma4.nvidia.specialized_decode.attention import prepare
+
+    set_random_seed(123)
+    num_heads = 4
+    dtype = torch.bfloat16
+    qkv = torch.randn(
+        (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim),
+        device="cuda",
+        dtype=dtype,
+    )
+    q_weight = torch.randn(head_dim, device="cuda", dtype=dtype)
+    k_weight = torch.randn_like(q_weight)
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64) + 17
+    rope = Gemma4RotaryEmbedding(
+        head_dim,
+        head_dim if head_dim == 256 else 128,
+        max(1024, num_tokens + 32),
+        10000,
+        True,
+        dtype,
+    ).to("cuda")
+    q, k, v = qkv.split(
+        [num_heads * head_dim, num_kv_heads * head_dim, num_kv_heads * head_dim], dim=-1
+    )
+    expected_q = torch.empty_like(q)
+    expected_k = torch.empty_like(k)
+    expected_v = torch.empty_like(v)
+    ops.rms_norm(
+        expected_q.view(num_tokens, num_heads, head_dim),
+        q.view(num_tokens, num_heads, head_dim),
+        torch.ones_like(q_weight) if round_before_weight else q_weight,
+        1e-6,
+    )
+    if round_before_weight:
+        expected_q.view(num_tokens, num_heads, head_dim).mul_(q_weight)
+    if num_kv_heads:
+        ops.rms_norm(
+            expected_k.view(num_tokens, num_kv_heads, head_dim),
+            k.view(num_tokens, num_kv_heads, head_dim),
+            torch.ones_like(k_weight) if round_before_weight else k_weight,
+            1e-6,
+        )
+        if round_before_weight:
+            expected_k.view(num_tokens, num_kv_heads, head_dim).mul_(k_weight)
+        ops.rms_norm(
+            expected_v.view(num_tokens, num_kv_heads, head_dim),
+            v.view(num_tokens, num_kv_heads, head_dim),
+            None,
+            1e-6,
+        )
+    ops.rotary_embedding(
+        positions,
+        expected_q,
+        expected_k if num_kv_heads else None,
+        head_dim,
+        rope.cos_sin_cache,
+        True,
+    )
+    actual = prepare(
+        qkv,
+        q_weight,
+        k_weight,
+        rope.cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        round_before_weight,
+    )
+    for output, expected in zip(actual, (expected_q, expected_k, expected_v)):
+        assert torch.equal(output, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Gemma4 cache fusion is SM90-only",
+)
+@pytest.mark.parametrize("num_tokens", [1, 5, 20, 128, 4096])
+@pytest.mark.parametrize("head_dim,kv_heads", [(256, 2), (512, 1)])
+@pytest.mark.parametrize("layout", ["NHD", "HND", "packed"])
+@pytest.mark.parametrize("partitions", [1, 6])
+@torch.inference_mode()
+def test_gemma4_preparation_writes_paged_cache_after_graph_replay(
+    num_tokens, head_dim, kv_heads, layout, partitions
+):
+    """Preserve Q and cached KV under changed inputs, slots, and padded rows."""
+    from vllm import _custom_ops as ops
+    from vllm.models.gemma4.nvidia.specialized_decode.attention import prepare
+
+    torch.manual_seed(714)
+    q_heads, page_size = 4, 16
+    pages = (num_tokens + 15) // 16 + 2
+    x = torch.randn(
+        num_tokens,
+        (q_heads + 2 * kv_heads) * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if partitions == 6:
+        x = torch.randn(6, *x.shape, device="cuda", dtype=torch.float32)
+    qw = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    kw = torch.randn_like(qw)
+    rope = torch.randn(num_tokens + 64, head_dim, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64) + 17
+    slots = torch.randperm(pages * page_size, device="cuda", dtype=torch.int64)[
+        :num_tokens
+    ].contiguous()
+    slots[::3] = -1
+    if num_tokens > 1:
+        slots = slots[:-1]
+    shape = (pages, page_size, kv_heads, head_dim)
+    if layout == "HND":
+        cache = torch.randn(
+            pages, kv_heads, page_size, head_dim, device="cuda", dtype=torch.bfloat16
+        ).transpose(1, 2)
+    else:
+        cache = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    packed = None
+    if layout == "packed":
+        packed = torch.randn(
+            pages,
+            kv_heads,
+            page_size,
+            2 * head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        key_cache, value_cache = packed.transpose(1, 2).split(head_dim, dim=-1)
+    else:
+        key_cache, value_cache = cache.clone(), cache.clone()
+    q = x.new_empty((num_tokens, q_heads * head_dim), dtype=torch.bfloat16)
+    scale = torch.ones(1, device="cuda")
+    args = (
+        x,
+        qw,
+        kw,
+        rope,
+        positions,
+        slots,
+        q,
+        key_cache,
+        value_cache,
+        q_heads,
+        kv_heads,
+        head_dim,
+        False,
+    )
+    torch.ops._C.gemma4_attention_prep_cache_out(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops._C.gemma4_attention_prep_cache_out(*args)
+    for _ in range(3):
+        x.normal_()
+        slots.copy_(slots.roll(1))
+        if packed is not None:
+            expected_packed = packed.clone()
+            expected_k, expected_v = expected_packed.transpose(1, 2).split(
+                head_dim, dim=-1
+            )
+        else:
+            expected_k, expected_v = key_cache.clone(), value_cache.clone()
+        reference = x
+        if partitions == 6:
+            reference = torch.zeros_like(x[0])
+            for part in x.unbind(0):
+                reference.add_(part)
+            reference = reference.bfloat16()
+        expected_q, k, v = prepare(
+            reference, qw, kw, rope, positions, q_heads, kv_heads, head_dim
+        )
+        ops.reshape_and_cache_flash(
+            k[: slots.numel()].view(-1, kv_heads, head_dim),
+            v[: slots.numel()].view(-1, kv_heads, head_dim),
+            expected_k,
+            expected_v,
+            slots,
+            "auto",
+            scale,
+            scale,
+        )
+        graph.replay()
+        assert torch.equal(q, expected_q)
+        assert torch.equal(key_cache, expected_k)
+        assert torch.equal(value_cache, expected_v)
