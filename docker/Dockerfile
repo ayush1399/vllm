@@ -381,6 +381,7 @@ COPY pyproject.toml setup.py CMakeLists.txt ./
 COPY tools/build_rust.py tools/build_rust.py
 COPY cmake cmake/
 COPY csrc csrc/
+COPY vllm/models/gemma4/nvidia/specialized_decode vllm/models/gemma4/nvidia/specialized_decode/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
 
