@@ -89,6 +89,71 @@ def _target_pdl_enabled(model):
 @pytest.mark.skipif(
     not current_platform.is_device_capability(90), reason="SM90 FP8 producers"
 )
+@pytest.mark.parametrize("num_speculative_tokens", [0, 4])
+@multi_gpu_test(num_gpus=8)
+def test_fp8_decode_graph_padding(
+    monkeypatch, vllm_runner, num_speculative_tokens, enable_pickle
+):
+    """Three live requests must decode correctly through padded FULL graphs."""
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM_E8M0", "1")
+    spec = (
+        {
+            "method": "mtp",
+            "model": os.environ.get(
+                "GEMMA4_MTP_MODEL", "google/gemma-4-31B-it-assistant"
+            ),
+            "num_speculative_tokens": num_speculative_tokens,
+        }
+        if num_speculative_tokens
+        else None
+    )
+    questions = ("7 times 8", "12 plus 15", "9 minus 5")
+    with vllm_runner(
+        os.environ.get("GEMMA4_FP8_MODEL", "RedHatAI/gemma-4-31B-it-FP8-block"),
+        additional_config={
+            "decode_backend": "latency_specialized",
+            "gemma4_pdl": False,
+        },
+        tensor_parallel_size=8,
+        dtype="bfloat16",
+        kv_cache_dtype="bfloat16",
+        max_model_len=32768,
+        max_num_seqs=4,
+        max_num_batched_tokens=32768,
+        enable_chunked_prefill=True,
+        language_model_only=True,
+        hf_overrides={"text_config": {"use_bidirectional_attention": None}},
+        attention_config={"backend": "FLASH_ATTN", "flash_attn_version": 4},
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 20]},
+        speculative_config=spec,
+    ) as runner:
+        generated = runner.llm.chat(
+            [
+                [
+                    {
+                        "role": "user",
+                        "content": "This is background text. " * 4096
+                        + f"What is {question}? Answer with only the integer.",
+                    }
+                ]
+                for question in questions
+            ],
+            SamplingParams(temperature=0, max_tokens=16, ignore_eos=True),
+            chat_template_kwargs={"enable_thinking": False},
+            use_tqdm=False,
+        )
+        assert len(generated) == 3
+        for output, answer in zip(generated, (56, 27, 4)):
+            assert len(output.outputs[0].token_ids) == 16
+            text = output.outputs[0].text
+            numbers = re.findall(r"-?\d+(?:\.\d+)?", text)
+            assert numbers, text
+            assert Decimal(numbers[0]) == answer, text
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="SM90 FP8 producers"
+)
 @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4])
 @multi_gpu_test(num_gpus=8)
 def test_fp8_mtp_producer_outputs(
