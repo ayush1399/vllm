@@ -491,42 +491,231 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, m) {
          TORCH_BOX(&gemma4_attention_prep_cache_out));
 }
 
-__global__ void combine_quant(const float* partial, const float* lse,
-                              const int* cu, const int* splits,
-                              __nv_fp8_e4m3* output, float* scales, int rows,
-                              int heads, int dim, int batches, int pitch,
-                              int64_t ls0, int64_t ls1, int64_t ls2) {
+template <int Threads>
+__device__ __forceinline__ void combine_weights_warp(const float* lse,
+                                                     float* weights, int tid,
+                                                     int count, int head,
+                                                     int row, int64_t ls0,
+                                                     int64_t ls1, int64_t ls2) {
+  using Reduce = cub::WarpReduce<float, Threads>;
+  __shared__ typename Reduce::TempStorage max_temp, sum_temp;
+  if (tid < Threads) {
+    constexpr unsigned mask = 0xffffffffu >> (32 - Threads);
+    float ls = tid < count ? lse[int64_t(tid) * ls0 + head * ls1 + row * ls2]
+                           : -__int_as_float(0x7f800000);
+#if __CUDA_ARCH__ >= 800
+    int ordered = __float_as_int(ls);
+    ordered ^= ordered < 0 ? 0x7fffffff : 0;
+    int mx_bits = __reduce_max_sync(mask, ordered);
+    mx_bits ^= mx_bits < 0 ? 0x7fffffff : 0;
+    float mx = __int_as_float(mx_bits);
+#else
+    float mx = Reduce(max_temp).Reduce(ls, CubMaxOp{});
+    mx = __shfl_sync(mask, mx, 0);
+#endif
+    if (mx == -__int_as_float(0x7f800000)) mx = 0.0f;
+    constexpr float log2e = 1.4426950408889634f;
+    float exponent = __fsub_rn(__fmul_rn(ls, log2e), __fmul_rn(mx, log2e));
+    float weight;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(weight) : "f"(exponent));
+    float total = Reduce(sum_temp).Sum(weight);
+    total = __shfl_sync(mask, total, 0);
+    float inv = total > 0.0f ? __frcp_rn(total) : 0.0f;
+    weights[tid] = __fmul_rn(weight, inv);
+  }
+}
+
+template <int Splits>
+__device__ __forceinline__ float combine_partials(const float* partial,
+                                                  const float* weights,
+                                                  int rows, int width, int row,
+                                                  int col) {
+  if constexpr (Splits == 8) {
+    float p[8], w[8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      p[s] = partial[(int64_t(s) * rows + row) * width + col];
+      w[s] = weights[s];
+    }
+    // Issue independent loads before the dependent FMA chain.
+    asm volatile(""
+                 :
+                 : "f"(p[0]), "f"(p[1]), "f"(p[2]), "f"(p[3]), "f"(p[4]),
+                   "f"(p[5]), "f"(p[6]), "f"(p[7]), "f"(w[0]), "f"(w[1]),
+                   "f"(w[2]), "f"(w[3]), "f"(w[4]), "f"(w[5]), "f"(w[6]),
+                   "f"(w[7])
+                 : "memory");
+    float value = 0.0f;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) value = fmaf(w[s], p[s], value);
+    return value;
+  }
+  float value = 0.0f;
+#pragma unroll
+  for (int s = 0; s < Splits; ++s)
+    value = fmaf(weights[s], partial[(int64_t(s) * rows + row) * width + col],
+                 value);
+  return value;
+}
+
+template <int Splits>
+__device__ __forceinline__ float combine_single_row(const float* partial,
+                                                    const float* lse, int width,
+                                                    int col, int head,
+                                                    int64_t ls0, int64_t ls1) {
+  float p[Splits], ls[Splits], w[Splits];
+#pragma unroll
+  for (int s = 0; s < Splits; ++s) {
+    p[s] = partial[int64_t(s) * width + col];
+    ls[s] = lse[int64_t(s) * ls0 + head * ls1];
+  }
+  // Overlap partial-result loads with the normalizer's input loads.
+  if constexpr (Splits == 4) {
+    asm volatile(""
+                 : "+f"(ls[0]), "+f"(ls[1]), "+f"(ls[2]), "+f"(ls[3])
+                 : "f"(p[0]), "f"(p[1]), "f"(p[2]), "f"(p[3])
+                 : "memory");
+  } else {
+    asm volatile(""
+                 : "+f"(ls[0]), "+f"(ls[1]), "+f"(ls[2]), "+f"(ls[3]),
+                   "+f"(ls[4]), "+f"(ls[5]), "+f"(ls[6]), "+f"(ls[7])
+                 : "f"(p[0]), "f"(p[1]), "f"(p[2]), "f"(p[3]), "f"(p[4]),
+                   "f"(p[5]), "f"(p[6]), "f"(p[7])
+                 : "memory");
+  }
+  float mx = -__int_as_float(0x7f800000);
+#pragma unroll
+  for (int s = 0; s < Splits; ++s) mx = fmaxf(mx, ls[s]);
+  if (mx == -__int_as_float(0x7f800000)) mx = 0.0f;
+  constexpr float log2e = 1.4426950408889634f;
+#pragma unroll
+  for (int s = 0; s < Splits; ++s) {
+    float exponent = __fsub_rn(__fmul_rn(ls[s], log2e), __fmul_rn(mx, log2e));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(w[s]) : "f"(exponent));
+  }
+  float total = __fadd_rn(__fadd_rn(w[0], w[1]), __fadd_rn(w[2], w[3]));
+  if constexpr (Splits == 8)
+    total = __fadd_rn(total,
+                      __fadd_rn(__fadd_rn(w[4], w[5]), __fadd_rn(w[6], w[7])));
+  float inv = total > 0.0f ? __frcp_rn(total) : 0.0f;
+  float value = 0.0f;
+#pragma unroll
+  for (int s = 0; s < Splits; ++s)
+    value = fmaf(__fmul_rn(w[s], inv), p[s], value);
+  return value;
+}
+
+__global__ __launch_bounds__(128, 1) void combine_quant(
+    const float* partial, const float* lse, const int* cu, const int* splits,
+    __nv_fp8_e4m3* output, float* scales, int rows, int heads, int dim,
+    int batches, int pitch, int64_t ls0, int64_t ls1, int64_t ls2) {
   int row = blockIdx.x, group = blockIdx.y, tid = threadIdx.x;
   int batch = 0;
   while (batch + 1 < batches && row >= cu[batch + 1]) ++batch;
-  int count = splits[batch];
+  // Padded requests have no initialized split count or attention partials.
+  int count = row < cu[batch + 1] ? splits[batch] : 0;
   int head = group * 128 / dim;
   using Reduce = cub::BlockReduce<float, 128>;
+  using MaxReduce = cub::BlockReduce<int, 128>;
   __shared__ typename Reduce::TempStorage temp;
+  __shared__ typename MaxReduce::TempStorage max_temp;
   __shared__ float weights[128];
   __shared__ float maximum, inverse;
-  float ls = tid < count ? lse[int64_t(tid) * ls0 + head * ls1 + row * ls2]
-                         : -__int_as_float(0x7f800000);
-  float mx = Reduce(temp).Reduce(ls, CubMaxOp{});
-  if (tid == 0) maximum = mx == -__int_as_float(0x7f800000) ? 0.0f : mx;
-  __syncthreads();
-  constexpr float log2e = 1.4426950408889634f;
-  float exponent = __fsub_rn(__fmul_rn(ls, log2e), __fmul_rn(maximum, log2e));
-  float weight;
-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(weight) : "f"(exponent));
-  float total = Reduce(temp).Sum(weight);
-  if (tid == 0) inverse = total > 0.0f ? 1.0f / total : 0.0f;
-  __syncthreads();
-  weights[tid] = __fmul_rn(weight, inverse);
-  __syncthreads();
   int width = heads * dim, col = group * 128 + tid;
   float value = 0.0f;
-  for (int s = 0; s < count; ++s)
-    value = fmaf(weights[s], partial[(int64_t(s) * rows + row) * width + col],
-                 value);
+  if (rows == 1 && count == 4) {
+    value = combine_single_row<4>(partial, lse, width, col, head, ls0, ls1);
+  } else if (rows == 1 && count == 8) {
+    value = combine_single_row<8>(partial, lse, width, col, head, ls0, ls1);
+  } else {
+    constexpr float log2e = 1.4426950408889634f;
+    if (count <= 4) {
+      combine_weights_warp<4>(lse, weights, tid, count, head, row, ls0, ls1,
+                              ls2);
+    } else if (count <= 8) {
+      combine_weights_warp<8>(lse, weights, tid, count, head, row, ls0, ls1,
+                              ls2);
+    } else if (count <= 16) {
+      combine_weights_warp<16>(lse, weights, tid, count, head, row, ls0, ls1,
+                               ls2);
+    } else if (count <= 32) {
+      combine_weights_warp<32>(lse, weights, tid, count, head, row, ls0, ls1,
+                               ls2);
+    } else {
+      float ls = tid < count ? lse[int64_t(tid) * ls0 + head * ls1 + row * ls2]
+                             : -__int_as_float(0x7f800000);
+      float mx = Reduce(temp).Reduce(ls, CubMaxOp{});
+      if (tid == 0) maximum = mx == -__int_as_float(0x7f800000) ? 0.0f : mx;
+      __syncthreads();
+      float exponent =
+          __fsub_rn(__fmul_rn(ls, log2e), __fmul_rn(maximum, log2e));
+      float weight;
+      asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(weight) : "f"(exponent));
+      float total = Reduce(temp).Sum(weight);
+      if (tid == 0) inverse = total > 0.0f ? 1.0f / total : 0.0f;
+      __syncthreads();
+      weights[tid] = __fmul_rn(weight, inverse);
+    }
+    __syncthreads();
+    if (count == 4) {
+      value = combine_partials<4>(partial, weights, rows, width, row, col);
+    } else if (count == 8) {
+      value = combine_partials<8>(partial, weights, rows, width, row, col);
+    } else if (count == 9) {
+      value = combine_partials<9>(partial, weights, rows, width, row, col);
+    } else if (count <= 32) {
+#define COMBINE_SPLITS(S)                                                 \
+  case S:                                                                 \
+    value = combine_partials<S>(partial, weights, rows, width, row, col); \
+    break
+      switch (count) {
+        COMBINE_SPLITS(1);
+        COMBINE_SPLITS(2);
+        COMBINE_SPLITS(3);
+        COMBINE_SPLITS(5);
+        COMBINE_SPLITS(6);
+        COMBINE_SPLITS(7);
+        COMBINE_SPLITS(10);
+        COMBINE_SPLITS(11);
+        COMBINE_SPLITS(12);
+        COMBINE_SPLITS(13);
+        COMBINE_SPLITS(14);
+        COMBINE_SPLITS(15);
+        COMBINE_SPLITS(16);
+        COMBINE_SPLITS(17);
+        COMBINE_SPLITS(18);
+        COMBINE_SPLITS(19);
+        COMBINE_SPLITS(20);
+        COMBINE_SPLITS(21);
+        COMBINE_SPLITS(22);
+        COMBINE_SPLITS(23);
+        COMBINE_SPLITS(24);
+        COMBINE_SPLITS(25);
+        COMBINE_SPLITS(26);
+        COMBINE_SPLITS(27);
+        COMBINE_SPLITS(28);
+        COMBINE_SPLITS(29);
+        COMBINE_SPLITS(30);
+        COMBINE_SPLITS(31);
+        COMBINE_SPLITS(32);
+        default:
+          break;
+      }
+#undef COMBINE_SPLITS
+    } else {
+#pragma unroll 32
+      for (int s = 0; s < count; ++s)
+        value = fmaf(weights[s],
+                     partial[(int64_t(s) * rows + row) * width + col], value);
+    }
+  }
   value = __bfloat162float(__float2bfloat16_rn(value));
-  float amax = Reduce(temp).Reduce(fabsf(value), CubMaxOp{});
+  int magnitude = __float_as_int(fabsf(value));
+  // Preserve fmax's NaN handling; -1 also decodes as NaN for an all-NaN group.
+  if (magnitude > 0x7f800000) magnitude = -1;
+  int amax_bits = MaxReduce(max_temp).Reduce(magnitude, CubMaxOp{});
   if (tid == 0) {
+    float amax = __int_as_float(amax_bits);
     inverse = amax != 0.0f ? __fdividef(448.0f, amax) : 1.0f;
     float scale;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(scale) : "f"(inverse));

@@ -640,7 +640,10 @@ steps:
     - vllm/model_executor/kernels/linear/
     - csrc/quantization/fused_kernels/
     - tests/v1/e2e/spec_decode/mtp/gemma4/test_mtp.py
+    - tests/kernels/attention/test_flash_attn.py
   commands:
     - >-
       pytest -v -s
       v1/e2e/spec_decode/mtp/gemma4/test_mtp.py::test_fp8_mtp_producer_outputs
+      v1/e2e/spec_decode/mtp/gemma4/test_mtp.py::test_fp8_decode_graph_padding
+      kernels/attention/test_flash_attn.py::test_gemma4_combine_quant_ignores_padded_requests_after_graph_replay

@@ -502,3 +502,56 @@ def test_fa4_combine_quant_preserves_bf16_rounding_after_graph_replay(
         ].t().repeat_interleave(128, 1)
         relative_l1 = (a - b).abs().sum() / b.abs().sum()
         assert relative_l1 < 1e-4
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90),
+    reason="Gemma4 combine quantization is SM90-only",
+)
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("query", [1, 5])
+@pytest.mark.parametrize("count", [4, 5, 8, 9, 16, 24, 32, 33, 64, 96, 128])
+@pytest.mark.parametrize("batches", [1, 4])
+@torch.inference_mode()
+def test_gemma4_combine_quant_ignores_padded_requests_after_graph_replay(
+    head_dim, query, count, batches
+):
+    """Unused requests have no split count; padded rows must not read their data."""
+    from vllm import _custom_ops  # noqa: F401
+
+    set_random_seed(714)
+    heads = 4
+    rows = batches * query
+    partial = torch.randn(count, rows, heads, head_dim, device="cuda")
+    lse = torch.randn(count, heads, rows, device="cuda")
+    cu = torch.arange(0, rows + 1, query, device="cuda", dtype=torch.int32)
+    splits = torch.full((batches,), count, device="cuda", dtype=torch.int32)
+    output = torch.empty(
+        rows, heads, head_dim, device="cuda", dtype=torch.float8_e4m3fn
+    )
+    scales = torch.empty(heads * head_dim // 128, (rows + 3) // 4 * 4, device="cuda")
+
+    def combine():
+        torch.ops._C.gemma4_combine_quant_out(partial, lse, cu, splits, output, scales)
+
+    combine()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        combine()
+    expected, expected_scales = output.clone(), scales.clone()
+    for actual_batches in (0, 1) if batches == 1 else (3, 1, 4):
+        actual = actual_batches * query
+        cu.copy_(
+            torch.arange(batches + 1, device="cuda").clamp(max=actual_batches) * query
+        )
+        splits.fill_(count)
+        splits[actual_batches:].fill_(1 << 30)
+        output.fill_(float("nan"))
+        scales.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(
+            output[:actual].view(torch.uint8), expected[:actual].view(torch.uint8)
+        )
+        assert torch.equal(scales[:, :actual], expected_scales[:, :actual])
+        assert torch.count_nonzero(output[actual:].float()) == 0
+        assert torch.all(scales[:, actual:rows] == 1)
