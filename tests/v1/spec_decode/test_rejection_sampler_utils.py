@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.triton_utils import triton
 from vllm.v1.spec_decode.fly import compute_fly_entropy
 from vllm.v1.watermarking import GumbelWatermarker
 from vllm.v1.watermarking.spec_decode import watermarked_rejection_sample
@@ -17,6 +18,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     gather_draft_sampled,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    _compute_local_logits_stats_kernel,
     rejection_sample,
 )
 
@@ -90,6 +92,86 @@ def _build_rejection_sample_inputs(
         temperature=temp_tensor,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("has_draft_logits", [False, True])
+def test_logits_stats_reuses_warmup_for_batch_sizes_and_offset_indices(
+    dtype: torch.dtype, has_draft_logits: bool
+):
+    """Scalar index views and batch divisibility must not cause inference JIT."""
+    torch.manual_seed(17)
+    vocab_size, block_size, max_rows = 8193, 8192, 32
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    target = torch.randn(max_rows, vocab_size, dtype=dtype, device="cuda")
+    draft = (
+        torch.randn(max_rows, 4, vocab_size, dtype=dtype, device="cuda")
+        if has_draft_logits
+        else None
+    )
+    temperature = torch.ones(max_rows, device="cuda")
+    temperature[::2] = 0
+    expected = torch.nn.functional.pad(
+        target.float(), (0, num_blocks * block_size - vocab_size), value=-float("inf")
+    ).view(max_rows, num_blocks, block_size)
+    expected_max, expected_argmax = expected.max(dim=-1)
+    expected_argmax += torch.arange(num_blocks, device="cuda") * block_size
+    expected_sumexp = (expected - expected_max[:, :, None]).exp().sum(dim=-1)
+
+    def run(rows, offset):
+        mapping = torch.empty(rows + offset, dtype=torch.int32, device="cuda")[offset:]
+        mapping.copy_(torch.arange(rows, device="cuda"))
+        positions = torch.empty(rows + offset, dtype=torch.int32, device="cuda")[
+            offset:
+        ]
+        positions.copy_(torch.arange(rows, device="cuda") % 5)
+        outputs = [
+            torch.full(
+                (rows, num_blocks),
+                -12345,
+                dtype=torch.int64 if i == 0 else torch.float32,
+                device="cuda",
+            )
+            for i in range(5)
+        ]
+        arguments = [item for t in outputs for item in (t, t.stride(0))]
+        compiled = _compute_local_logits_stats_kernel[(rows, num_blocks)](
+            *arguments,
+            target,
+            target.stride(0),
+            draft,
+            draft.stride(0) if draft is not None else 0,
+            draft.stride(1) if draft is not None else 0,
+            mapping,
+            positions,
+            temperature,
+            vocab_size,
+            rows,
+            BLOCK_SIZE=block_size,
+            HAS_DRAFT_LOGITS=has_draft_logits,
+            DRAFT_LOGITS_NUM_SHARDS=1,
+        )
+        valid = torch.zeros(rows, dtype=torch.bool, device="cuda")
+        valid[:-1] = positions[1:] != 0
+        greedy = valid & (temperature[:rows] == 0)
+        random = valid & ~greedy
+        torch.testing.assert_close(outputs[0][greedy], expected_argmax[:rows][greedy])
+        torch.testing.assert_close(
+            outputs[1][valid], expected_max[:rows][valid], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            outputs[2][random], expected_sumexp[:rows][random], rtol=2e-5, atol=2e-5
+        )
+        for output in outputs:
+            assert (output[~valid] == -12345).all()
+        return compiled
+
+    warmed = run(20, 0)
+    for rows, offset in ((6, 0), (5, 0), (16, 0), (32, 1), (16, 2), (5, 3)):
+        assert run(rows, offset) is warmed
+    bonus_only = run(1, 0)
+    assert bonus_only is not warmed
+    assert run(1, 1) is bonus_only
 
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0])

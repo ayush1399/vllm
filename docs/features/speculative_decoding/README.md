@@ -43,6 +43,14 @@ For reproducible measurements in your environment, use
 [`examples/features/speculative_decoding/spec_decode_offline.py`](../../../examples/features/speculative_decoding/spec_decode_offline.py)
 or the [benchmark CLI guide](../../benchmarking/cli.md).
 
+The V2 model runner's local logits statistics kernel reuses warmed variants
+across batch-size divisibility changes and sliced request-index buffers during
+speculative verification. This avoids additional JIT compilation for those
+changes while retaining the fast path for a single bonus-token row.
+With JIT warmup enabled (the default), startup explicitly exercises bonus-only
+verification with both model-dtype logits and processed FP32 logits, including
+the configured draft-logits layout.
+
 ## Custom Proposer Backend (Experimental)
 
 You can plug in your own custom proposer class for speculative decoding by setting the method to `custom_class` and providing the full module path to your class.

@@ -1027,6 +1027,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The CPU worker sizes the KV cache from process RSS, which would
             # keep the extra pass's buffers, and has no warmup OOM to prevent.
             return
+        self._dummy_rejection_sampler_run(logits, dummy_input_batch)
         # Warmup-param pass: warmup_kernels (run after the KV cache is sized)
         # pays for the fp32 logits pipeline, so the profiled peak must too.
         warmup_params = SamplingParams.for_sampler_warmup()
@@ -1034,6 +1035,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.sampler.add_request(req_idx, warmup_params)
         self.sampler.apply_staged_writes()
         self.sampler(logits, dummy_input_batch)
+        self._dummy_rejection_sampler_run(logits, dummy_input_batch)
+
+    def _dummy_rejection_sampler_run(
+        self, logits: torch.Tensor, input_batch: InputBatch
+    ) -> None:
+        if not isinstance(self.rejection_sampler, RejectionSampler) or not (
+            self.vllm_config.kernel_config.enable_jit_warmup
+        ):
+            return
+        assert self.speculator is not None
+        # A bonus-only chunk bypasses rejection sampling in scheduler warmup.
+        # Run with the current params to cover model-dtype and FP32 layouts.
+        self.rejection_sampler._verify(
+            logits[:1],
+            self.speculator.draft_logits,
+            input_batch.input_ids[:1],
+            input_batch.positions[:1],
+            input_batch.cu_num_logits[:2],
+            input_batch.idx_mapping[:1],
+            input_batch.idx_mapping_np[:1],
+            input_batch.expanded_idx_mapping[:1],
+            input_batch.expanded_local_pos[:1],
+            input_batch.seq_lens_cpu_upper_bound[:1].numpy(),
+            input_batch.input_ids[:1],
+        )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:

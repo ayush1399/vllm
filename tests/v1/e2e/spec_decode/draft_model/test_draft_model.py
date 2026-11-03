@@ -102,6 +102,80 @@ def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool, vllm_runne
     assert_draft_model_correctness(args, vllm_runner)
 
 
+def _probe_bonus_logits_stats_warmup(worker):
+    import torch
+
+    from vllm.triton_utils import triton
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+        _compute_local_logits_stats_kernel,
+        rejection_sample,
+    )
+
+    runner = worker.model_runner
+    hidden = torch.zeros(
+        1,
+        worker.model_config.get_hidden_size(),
+        dtype=worker.model_config.dtype,
+        device=worker.device,
+    )
+    logits = worker.get_model().compute_logits(hidden)
+    kernel_cache = _compute_local_logits_stats_kernel.device_caches[
+        triton.runtime.driver.active.get_current_device()
+    ][0]
+    before = len(kernel_cache)
+    index = torch.zeros(2, dtype=torch.int64, device=worker.device)[1:]
+    local_pos = torch.zeros(2, dtype=torch.int32, device=worker.device)[1:]
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=worker.device)
+    for dtype in {logits.dtype, torch.float32}:
+        sampled, counts = rejection_sample(
+            logits.to(dtype),
+            runner.speculator.draft_logits,
+            local_pos,
+            cu,
+            index,
+            index,
+            index,
+            local_pos,
+            runner.sampler.sampling_states.temperature.gpu,
+            runner.sampler.sampling_states.seeds.gpu,
+            runner.num_speculative_steps,
+            draft_logits_num_shards=runner.rejection_sampler.draft_logits_num_shards,
+        )
+        assert counts.item() == 1
+        assert 0 <= sampled[0, 0].item() < logits.shape[-1]
+    return len(kernel_cache) - before
+
+
+@pytest.mark.parametrize("draft_sample_method", ["greedy", "probabilistic"])
+@single_gpu_only
+def test_bonus_logits_stats_warmed_at_startup(
+    vllm_runner, enable_pickle, draft_sample_method
+):
+    """Bonus-only chunks must reuse startup kernels for both logits dtypes."""
+    with vllm_runner(
+        "Qwen/Qwen3-0.6B",
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=128,
+        gpu_memory_utilization=0.5,
+        kernel_config={"enable_jit_warmup": True},
+        speculative_config={
+            "method": "draft_model",
+            "model": "Qwen/Qwen3-0.6B",
+            "num_speculative_tokens": 4,
+            "draft_sample_method": draft_sample_method,
+        },
+    ) as runner:
+        assert runner.llm.collective_rpc(_probe_bonus_logits_stats_warmup) == [0]
+        outputs = runner.llm.generate(
+            "The capital of France is",
+            SamplingParams(temperature=0, max_tokens=8, ignore_eos=True),
+            use_tqdm=False,
+        )
+        assert len(outputs[0].outputs[0].token_ids) == 8
+
+
 def _draft_deep_gemm_warmup_status(worker):
     from vllm.model_executor.warmup.deep_gemm_warmup import (
         FP8_GEMM_NT_WARMUP_CACHE,

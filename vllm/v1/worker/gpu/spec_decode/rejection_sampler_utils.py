@@ -208,7 +208,14 @@ def _is_bonus_logit(expanded_local_pos_ptr, logit_idx, num_logits):
     return next_local_pos == 0
 
 
-@triton.jit
+# Preserve the bonus-only num_logits == 1 specialization.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "num_logits",
+        "expanded_idx_mapping_ptr",
+        "expanded_local_pos_ptr",
+    ]
+)
 def _compute_local_logits_stats_kernel(
     # [num_logits, num_blocks]
     target_local_argmax_ptr,
