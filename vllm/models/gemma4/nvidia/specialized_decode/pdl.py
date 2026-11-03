@@ -18,8 +18,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
-@functools.cache
-def _library():
+PREBUILT_DIR = Path(__file__).parent / "prebuilt"
+
+
+def build(build_dir: Path | None = None) -> str:
+    """Compile the PDL library, by default into the package for image builds."""
     from torch.utils.cpp_extension import load
 
     spec = importlib.util.find_spec("flashinfer")
@@ -40,9 +43,12 @@ def _library():
         digest.update(path.read_bytes())
     digest.update(torch.__version__.encode())
     name = "gemma4_pdl_" + digest.hexdigest()[:16]
-    build = Path(envs.VLLM_CACHE_ROOT) / "gemma4_pdl" / name
-    build.mkdir(parents=True, exist_ok=True)
-    library = load(
+    prebuilt = PREBUILT_DIR / name / f"{name}.so"
+    if build_dir is not None and prebuilt.is_file():
+        return str(prebuilt)
+    build_dir = (build_dir or PREBUILT_DIR) / name
+    build_dir.mkdir(parents=True, exist_ok=True)
+    return load(
         name=name,
         sources=[str(source / "pdl_driver.cu")],
         extra_include_paths=[str(headers), str(data / "cutlass/include")],
@@ -53,11 +59,14 @@ def _library():
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
         ],
-        extra_ldflags=["-lcuda"],
-        build_directory=str(build),
+        build_directory=str(build_dir),
         is_python_module=False,
     )
-    lib = ctypes.CDLL(library)
+
+
+@functools.cache
+def _library():
+    lib = ctypes.CDLL(build(Path(envs.VLLM_CACHE_ROOT) / "gemma4_pdl"))
     pointer, integer = ctypes.c_void_p, ctypes.c_int
     lib.initialize_pdl.argtypes = []
     lib.initialize_pdl.restype = integer

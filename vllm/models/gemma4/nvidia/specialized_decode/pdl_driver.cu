@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 #include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 
 #include "full_chain.cuh"
@@ -37,15 +38,33 @@ int initialize_kernel() {
                                   smem_size<BN, Stages>()));
 }
 
+// Resolved through the runtime so the library does not link libcuda.so,
+// which runtime images only provide as the driver-injected libcuda.so.1.
+PFN_cuTensorMapEncodeTiled_v12000 encode_tiled() {
+  static PFN_cuTensorMapEncodeTiled_v12000 fn = [] {
+    void* ptr = nullptr;
+    cudaDriverEntryPointQueryResult status;
+    if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &ptr, 12000,
+                                         cudaEnableDefault, &status) !=
+            cudaSuccess ||
+        status != cudaDriverEntryPointSuccess)
+      ptr = nullptr;
+    return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(ptr);
+  }();
+  return fn;
+}
+
 int encode(CUtensorMap* map, void* data, CUtensorMapDataType dtype,
            uint64_t cols, uint64_t rows, uint64_t stride, uint32_t tile_cols,
            uint32_t tile_rows, CUtensorMapSwizzle swizzle) {
+  auto fn = encode_tiled();
+  if (!fn) return int(CUDA_ERROR_NOT_FOUND);
   uint64_t dims[] = {cols, rows};
   uint32_t tile[] = {tile_cols, tile_rows}, step[] = {1, 1};
-  return int(cuTensorMapEncodeTiled(map, dtype, 2, data, dims, &stride, tile,
-                                    step, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                                    swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                                    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  return int(fn(map, dtype, 2, data, dims, &stride, tile, step,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 }
 
 template <int N, int BN, int Stages, int SplitK = 1>

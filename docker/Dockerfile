@@ -1047,6 +1047,11 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # Until then, add /usr/local/nvidia/lib64 before the image cuda path to allow override.
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
+# Prebuild the Gemma4 SM90 PDL GEMM library so serving never JIT-compiles it.
+RUN python3 -c "from vllm.models.gemma4.nvidia.specialized_decode.pdl import build; print(build())" \
+    && find "$(python3 -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')/models/gemma4/nvidia/specialized_decode/prebuilt" \
+        -type f ! -name '*.so' -delete
+
 # Copy examples and benchmarks at the end to minimize cache invalidation
 COPY examples examples
 COPY benchmarks benchmarks
