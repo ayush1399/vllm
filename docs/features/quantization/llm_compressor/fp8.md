@@ -34,6 +34,12 @@ The FP8 types typically supported in hardware have two distinct representations,
     [`KernelConfig`](../../../cli/serve.md#kernelconfig) in the CLI
     reference and shown by `vllm serve --help=KernelConfig`.
 
+DeepGEMM warmup includes eligible layers in both the target and draft models
+when using speculative decoding. `VLLM_DEEP_GEMM_WARMUP=relax` (the default)
+warms shapes selected by heuristics, `full` warms every token count up to the
+batch limit, and `skip` disables this warmup. Warming FP8 draft models moves
+their kernel compilation into startup instead of the first inference batches.
+
 ## Experimental Gemma4 producer fusion on Hopper
 
 `--additional-config '{"decode_backend":"latency_specialized"}'` enables an opt-in FP8-input

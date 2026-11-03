@@ -102,6 +102,57 @@ def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool, vllm_runne
     assert_draft_model_correctness(args, vllm_runner)
 
 
+def _draft_deep_gemm_warmup_status(worker):
+    from vllm.model_executor.warmup.deep_gemm_warmup import (
+        FP8_GEMM_NT_WARMUP_CACHE,
+        _deep_gemm_linear_data,
+    )
+
+    draft = worker.get_draft_model()
+    shapes = {
+        tuple(data[0].shape)
+        for layer in draft.modules()
+        if (data := _deep_gemm_linear_data(layer)) is not None
+    }
+    return sorted(shapes), sorted(shapes - FP8_GEMM_NT_WARMUP_CACHE)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="DeepGEMM requires CUDA")
+@single_gpu_only
+def test_fp8_draft_model_deep_gemm_warmup(monkeypatch, vllm_runner, enable_pickle):
+    """FP8 draft GEMM families must be warmed before the first generation."""
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    if not is_deep_gemm_supported():
+        pytest.skip("DeepGEMM is unavailable")
+    monkeypatch.setenv("VLLM_DEEP_GEMM_WARMUP", "relax")
+    with vllm_runner(
+        "Qwen/Qwen3-0.6B",
+        dtype="bfloat16",
+        max_model_len=512,
+        max_num_seqs=4,
+        max_num_batched_tokens=512,
+        gpu_memory_utilization=0.6,
+        kernel_config={"linear_backend": "deep_gemm"},
+        speculative_config={
+            "method": "draft_model",
+            "model": "Qwen/Qwen3-4B-FP8",
+            "num_speculative_tokens": 1,
+        },
+    ) as runner:
+        for shapes, missing in runner.llm.collective_rpc(
+            _draft_deep_gemm_warmup_status
+        ):
+            assert shapes, "The draft must exercise block-FP8 DeepGEMM layers"
+            assert not missing, f"Draft GEMM weights were not warmed: {missing}"
+        outputs = runner.llm.generate(
+            "The capital of France is",
+            SamplingParams(temperature=0, max_tokens=8, ignore_eos=True),
+            use_tqdm=False,
+        )
+        assert len(outputs[0].outputs[0].token_ids) == 8
+
+
 @single_gpu_only
 def test_draft_model_realistic_example(vllm_runner):
     args = ArgsTest(
